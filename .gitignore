@@ -1,0 +1,5 @@
+cache/
+__pycache__/
+*.pyc
+open.json
+extract.json
