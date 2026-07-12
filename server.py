@@ -40,7 +40,8 @@ class ExtractRequest(BaseModel):
     elements: list[int]
     name: Optional[str] = None
     out_dir: Optional[str] = None
-    moves: Optional[dict[str, list[float]]] = None  # stepId -> [dx,dy,dz] metres
+    moves: Optional[dict[str, list[float]]] = None    # stepId -> [dx,dy,dz] metres
+    deforms: Optional[dict[str, list[float]]] = None  # stepId -> 16 floats (row-major 4x4, IFC world m)
 
 
 class RevealRequest(BaseModel):
@@ -137,7 +138,7 @@ def extract(request: ExtractRequest) -> dict[str, Any]:
         if job and job.is_alive():
             raise HTTPException(409, "Eksport juba käib")
         out_dir = Path(request.out_dir) if request.out_dir else None
-        job = engine.Job("extract", lambda status: model.extract(request.elements, request.name, out_dir, status, moves=request.moves))
+        job = engine.Job("extract", lambda status: model.extract(request.elements, request.name, out_dir, status, moves=request.moves, deforms=request.deforms))
         state["extract_job"] = job
         job.start()
     return {"started": True}

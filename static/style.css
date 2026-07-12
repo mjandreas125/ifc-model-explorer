@@ -184,7 +184,14 @@ input, select { font: inherit; }
 .detail-members {
   overflow-y: auto; border-top: 1px solid #e4e9ee;
   padding-top: 7px; font-size: 12.5px; min-height: 40px;
+  flex: 1 1 auto;              /* take the middle space, scroll internally */
 }
+/* keep action controls pinned + visible no matter how long the list is */
+.detail > .hint, .detail > .export-name, .detail > .btn-wide,
+.detail > .extract-status, .detail > .editor-btns, .detail > .btn-remove {
+  flex: 0 0 auto;
+}
+#editor-list { flex: 1 1 auto; min-height: 60px; }
 .member-class { color: #8b96a2; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; margin: 7px 0 3px; }
 .member-row { display: flex; justify-content: space-between; gap: 10px; padding: 1.5px 0; color: #33404f; }
 .member-row .n { font-variant-numeric: tabular-nums; color: #6a7683; flex: none; }

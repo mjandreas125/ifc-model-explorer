@@ -561,6 +561,35 @@ function selectElementByRec(r, { fit = false } = {}) {
   setBase([...elementSet(r)], { fit });
 }
 
+// "layer" = every part of the same reinforcement layer inside this element:
+// same package + same IFC class + same Name (e.g. all bars named "REBAR", or a
+// whole mesh split into pieces) — so one Alt+click grabs the entire layer.
+function layerSet(r) {
+  const pkg = state.rec.pkg[r];
+  const cls = recClass(r);
+  const nm = state.names.get(state.rec.ids[r]) || "";
+  const out = [];
+  for (let x = 0; x < state.rec.count; x++) {
+    if (state.hidden.has(x)) continue;
+    if (state.rec.pkg[x] !== pkg) continue;
+    if (recClass(x) !== cls) continue;
+    if ((state.names.get(state.rec.ids[x]) || "") !== nm) continue;
+    out.push(x);
+  }
+  return out.length ? out : [r];
+}
+function toggleLayer(r) {
+  pushHistory();
+  const layer = layerSet(r);
+  const anySelected = layer.some((x) => state.selected.has(x));
+  if (anySelected) {
+    for (const x of layer) { state.base.delete(x); state.excluded.add(x); }
+  } else {
+    for (const x of layer) { state.base.add(x); state.excluded.delete(x); }
+  }
+  refreshSelection({ fit: false });
+}
+
 /* --------------------------------------------------------------- hide */
 function rebuildHidden() {
   for (const entry of state.meshEntries) rebuildEntry(entry);
@@ -677,10 +706,10 @@ canvas.addEventListener("pointerup", (e) => {
   downPos = null;
   if (moved > 5 || e.button !== 0 || state.isolated) return;
   const hit = pick(e);
-  if (e.ctrlKey || e.metaKey || e.altKey) {
-    if (hit) togglePart(hit.rec);            // Ctrl/Alt = add/remove a SINGLE part
-    return;
-  }
+  const ctrl = e.ctrlKey || e.metaKey;
+  if (e.altKey && ctrl) { if (hit) toggleLayer(hit.rec); return; }        // Ctrl+Alt = add/remove whole layer
+  if (e.altKey) { if (hit) setBase(layerSet(hit.rec), { fit: false }); return; } // Alt = select whole layer
+  if (ctrl) { if (hit) togglePart(hit.rec); return; }                    // Ctrl = add/remove single part
   if (!hit) { setBase([]); return; }
   if (isShell(hit.rec)) selectElementByRec(hit.rec); // shell → whole element + internals
   else setBase([hit.rec], { fit: false });           // rebar/embed → just this one part
@@ -1074,7 +1103,8 @@ $("search").addEventListener("input", renderList);
 $("category-filter").addEventListener("change", renderList);
 
 /* ------------------------------------------------------------- extract */
-async function runExtract(elements, name, moves, statusEl, button) {
+async function runExtract(elements, name, opts, statusEl, button) {
+  opts = opts || {};
   button.disabled = true;
   statusEl.hidden = false;
   statusEl.className = "extract-status";
@@ -1083,7 +1113,7 @@ async function runExtract(elements, name, moves, statusEl, button) {
     const res = await fetch("/api/extract", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ elements, name, moves }),
+      body: JSON.stringify({ elements, name, moves: opts.moves || null, deforms: opts.deforms || null }),
     });
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     while (true) {
@@ -1116,6 +1146,13 @@ $("btn-extract").addEventListener("click", () => {
   runExtract(elements, $("export-name").value.trim() || defaultExportName(), null, $("extract-status"), $("btn-extract"));
 });
 
+function matrixRows(m) {
+  const e = m.elements;                     // three.js Matrix4 is column-major
+  const rows = [];
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) rows.push(e[i + 4 * j]);
+  return rows;                              // 16 floats, row-major
+}
+
 /* ================================================================ EDITOR */
 let tab = "project";
 const editor = {
@@ -1132,6 +1169,7 @@ function setTab(next) {
   $("tab-editor").classList.toggle("on", tab === "editor");
   root.visible = tab === "project";
   editorRoot.visible = tab === "editor";
+  $("editor-panel").hidden = tab !== "editor";   // the whole editor panel (with the Save button)
   if (selFillMesh) selFillMesh.visible = tab === "project";
   if (selLineMesh) selLineMesh.visible = tab === "project";
   if (hoverLineMesh) hoverLineMesh.visible = tab === "project";
@@ -1144,8 +1182,27 @@ function setTab(next) {
 $("tab-project").addEventListener("click", () => setTab("project"));
 $("tab-editor").addEventListener("click", () => setTab("editor"));
 
+// IFC-local matrix for an editor item: translate(offset) ∘ scaleAboutPivot(axis)
+function itemMatrixIFC(it) {
+  const m = new THREE.Matrix4();
+  if (it.resize) {
+    const { axis, factor, pivot } = it.resize;
+    const s = [1, 1, 1]; s[axis] = factor;
+    const t = [0, 0, 0]; t[axis] = pivot * (1 - factor);
+    m.set(s[0], 0, 0, t[0], 0, s[1], 0, t[1], 0, 0, s[2], t[2], 0, 0, 0, 1);
+  }
+  const tm = new THREE.Matrix4().makeTranslation(it.offset.x, it.offset.y, it.offset.z);
+  return tm.multiply(m);
+}
+function editorUpdateItem(it) {
+  it.mesh.matrix.copy(itemMatrixIFC(it));
+  it.mesh.matrixWorldNeedsUpdate = true;
+}
+
 function editorSnapshot() {
-  return [...editor.items.entries()].map(([r, it]) => [r, it.offset.x, it.offset.y, it.offset.z]);
+  return [...editor.items.entries()].map(([r, it]) => ({
+    r, o: [it.offset.x, it.offset.y, it.offset.z], resize: it.resize ? { ...it.resize } : null,
+  }));
 }
 function editorPushHistory() {
   editor.undo.push({ items: editorSnapshot(), selected: new Set(editor.selected) });
@@ -1154,15 +1211,16 @@ function editorPushHistory() {
 function editorUndo() {
   const snap = editor.undo.pop();
   if (!snap) return;
-  const keep = new Set(snap.items.map(([r]) => r));
+  const keep = new Set(snap.items.map((s) => s.r));
   for (const [r, it] of [...editor.items]) {
     if (!keep.has(r)) { editorRoot.remove(it.mesh); it.mesh.geometry.dispose(); editor.items.delete(r); }
   }
-  for (const [r, x, y, z] of snap.items) {
-    if (!editor.items.has(r)) editorAddItem(r);
-    const it = editor.items.get(r);
-    it.offset.set(x, y, z);
-    it.mesh.position.copy(it.offset);
+  for (const s of snap.items) {
+    if (!editor.items.has(s.r)) editorAddItem(s.r);
+    const it = editor.items.get(s.r);
+    it.offset.set(s.o[0], s.o[1], s.o[2]);
+    it.resize = s.resize ? { ...s.resize } : null;
+    editorUpdateItem(it);
   }
   editor.selected = new Set([...snap.selected].filter((r) => editor.items.has(r)));
   editorApplyVisual();
@@ -1173,8 +1231,11 @@ function editorAddItem(r) {
   const { geometry } = geometryFromRecs([r], true, false);
   const mesh = new THREE.Mesh(geometry, matBase);
   mesh.userData.rec = r;
+  mesh.matrixAutoUpdate = false;
   editorRoot.add(mesh);
-  editor.items.set(r, { mesh, offset: new THREE.Vector3() });
+  const it = { mesh, offset: new THREE.Vector3(), resize: null, bbox: geometry.boundingBox.clone() };
+  editor.items.set(r, it);
+  editorUpdateItem(it);
 }
 function editorPaste() {
   if (!clipboard.length) { toast("Kopeeri kõigepealt valik projektist (Ctrl+C)"); return; }
@@ -1224,39 +1285,78 @@ function editorPick(e) {
   const hits = raycaster.intersectObjects([...editor.items.values()].map((it) => it.mesh), false);
   return hits[0] || null;
 }
+const IFC_INV = new THREE.Matrix4();  // inverse of editorRoot world matrix (world → IFC)
+function editorRayIFC() {
+  editorRoot.updateMatrixWorld(true);
+  IFC_INV.copy(editorRoot.matrixWorld).invert();
+  return raycaster.ray.clone().applyMatrix4(IFC_INV);
+}
 function editorPointerDown(e) {
   if (e.button !== 0) return;
   const hit = editorPick(e);
   if (hit && editor.selected.has(hit.object.userData.rec)) {
-    // start dragging the selection
     editorPushHistory();
-    const planeNormal = e.shiftKey
-      ? camera.getWorldDirection(new THREE.Vector3()).setY(0).normalize().negate()
-      : new THREE.Vector3(0, 1, 0);
-    if (e.shiftKey && planeNormal.lengthSq() < 0.01) planeNormal.set(0, 0, 1);
-    editor.drag = {
-      plane: new THREE.Plane().setFromNormalAndCoplanarPoint(planeNormal, hit.point),
-      start: hit.point.clone(),
-      vertical: e.shiftKey,
-      moved: false,
-    };
+    if (e.shiftKey) {
+      // RESIZE: stretch/shrink the grabbed part along its longest axis about the far end
+      const it = editor.items.get(hit.object.userData.rec);
+      const size = it.bbox.getSize(new THREE.Vector3());
+      const axis = size.x >= size.y && size.x >= size.z ? 0 : (size.y >= size.z ? 1 : 2);
+      setPointerFromEvent(e);
+      const hitIfc = hit.point.clone().applyMatrix4(IFC_INV.copy(editorRoot.matrixWorld).invert());
+      const lo = it.bbox.min.getComponent(axis), hi = it.bbox.max.getComponent(axis);
+      const nearHi = Math.abs(hitIfc.getComponent(axis) - hi) < Math.abs(hitIfc.getComponent(axis) - lo);
+      const pivot = nearHi ? lo : hi;      // fixed (far) end
+      const origEnd = nearHi ? hi : lo;    // grabbed (moving) end
+      editor.drag = { mode: "resize", item: it, axis, pivot, origEnd, center: it.bbox.getCenter(new THREE.Vector3()), moved: false };
+    } else {
+      // MOVE: drag on ground plane (XZ); Alt = vertical (Y)
+      const vertical = e.altKey;
+      const planeNormal = vertical
+        ? camera.getWorldDirection(new THREE.Vector3()).setY(0).normalize().negate()
+        : new THREE.Vector3(0, 1, 0);
+      if (vertical && planeNormal.lengthSq() < 0.01) planeNormal.set(0, 0, 1);
+      editor.drag = {
+        mode: "move",
+        plane: new THREE.Plane().setFromNormalAndCoplanarPoint(planeNormal, hit.point),
+        start: hit.point.clone(), vertical, moved: false,
+      };
+    }
     controls.enabled = false;
   } else {
     editor.downPos = [e.clientX, e.clientY, e.ctrlKey || e.metaKey];
   }
 }
 function editorPointerMove(e) {
+  if (editor.drag && editor.drag.mode === "resize") {
+    setPointerFromEvent(e);
+    const ray = editorRayIFC();
+    const d = editor.drag;
+    const pivotVec = d.center.clone(); pivotVec.setComponent(d.axis, d.pivot);
+    // closest point of the IFC-space ray to the axis line through pivotVec
+    const ro = ray.origin, rd = ray.direction;
+    const w0 = ro.clone().sub(pivotVec);
+    const a = rd.dot(rd), b = rd.getComponent(d.axis), dd = rd.dot(w0), e2 = w0.getComponent(d.axis);
+    const denom = a - b * b;
+    const tc = Math.abs(denom) < 1e-9 ? e2 : (a * e2 - b * dd) / denom;
+    const grabbed = d.pivot + tc;
+    let factor = (grabbed - d.pivot) / (d.origEnd - d.pivot);
+    factor = Math.max(0.05, Math.min(20, factor));
+    d.item.resize = { axis: d.axis, factor, pivot: d.pivot };
+    editorUpdateItem(d.item);
+    d.moved = true;
+    return;
+  }
   if (editor.drag) {
     setPointerFromEvent(e);
     const point = new THREE.Vector3();
     if (!raycaster.ray.intersectPlane(editor.drag.plane, point)) return;
     const deltaWorld = point.clone().sub(editor.drag.start);
     if (editor.drag.vertical) { deltaWorld.x = 0; deltaWorld.z = 0; }
-    // world -> IFC axes: (wx, wy, wz) -> (wx, -wz, wy)
     const deltaIfc = new THREE.Vector3(deltaWorld.x, -deltaWorld.z, deltaWorld.y);
     for (const r of editor.selected) {
       const it = editor.items.get(r);
-      it.mesh.position.copy(it.offset.clone().add(deltaIfc));
+      it.mesh.matrix.copy(itemMatrixIFC(it)).premultiply(new THREE.Matrix4().makeTranslation(deltaIfc.x, deltaIfc.y, deltaIfc.z));
+      it.mesh.matrixWorldNeedsUpdate = true;
     }
     editor.drag.deltaIfc = deltaIfc;
     editor.drag.moved = true;
@@ -1267,14 +1367,16 @@ function editorPointerMove(e) {
 }
 function editorPointerUp(e) {
   if (editor.drag) {
-    if (editor.drag.moved && editor.drag.deltaIfc) {
+    if (editor.drag.mode === "resize") {
+      if (!editor.drag.moved) editor.undo.pop();
+    } else if (editor.drag.moved && editor.drag.deltaIfc) {
       for (const r of editor.selected) {
         const it = editor.items.get(r);
         it.offset.add(editor.drag.deltaIfc);
-        it.mesh.position.copy(it.offset);
+        editorUpdateItem(it);
       }
     } else {
-      editor.undo.pop(); // click on selected without movement — drop the history entry
+      editor.undo.pop();
     }
     editor.drag = null;
     controls.enabled = true;
@@ -1304,9 +1406,11 @@ function renderEditorPanel() {
   } else {
     const rows = [];
     for (const [r, it] of editor.items) {
-      const movedTag = it.offset.lengthSq() > 1e-9 ? ` <i>· nihutatud</i>` : "";
+      let tag = "";
+      if (it.resize) tag = ` <i>· pikkus ${Math.round(it.resize.factor * 100)}%</i>`;
+      else if (it.offset.lengthSq() > 1e-9) tag = ` <i>· nihutatud</i>`;
       rows.push(`<div class="member-row editor-row ${editor.selected.has(r) ? "sel" : ""}" data-rec="${r}">` +
-        `<span class="t">${esc(recName(r))}${movedTag}</span><span class="n">${esc(recMark(r))}</span></div>`);
+        `<span class="t">${esc(recName(r))}${tag}</span><span class="n">${esc(recMark(r))}</span></div>`);
     }
     listEl.innerHTML = rows.join("");
     for (const row of listEl.querySelectorAll(".editor-row")) {
@@ -1338,12 +1442,15 @@ $("btn-clear-editor").addEventListener("click", () => { editorPushHistory(); edi
 $("btn-editor-extract").addEventListener("click", () => {
   if (!editor.items.size) return;
   const elements = [...editor.items.keys()].map((r) => state.rec.ids[r]);
-  const moves = {};
+  const moves = {}, deforms = {};
   for (const [r, it] of editor.items) {
-    if (it.offset.lengthSq() > 1e-9) moves[String(state.rec.ids[r])] = [it.offset.x, it.offset.y, it.offset.z];
+    const id = String(state.rec.ids[r]);
+    if (it.resize) deforms[id] = matrixRows(itemMatrixIFC(it));       // baked geometry
+    else if (it.offset.lengthSq() > 1e-9) moves[id] = [it.offset.x, it.offset.y, it.offset.z];
   }
   runExtract(elements, $("editor-name").value.trim() || defaultEditorName(),
-    Object.keys(moves).length ? moves : null, $("editor-extract-status"), $("btn-editor-extract"));
+    { moves: Object.keys(moves).length ? moves : null, deforms: Object.keys(deforms).length ? deforms : null },
+    $("editor-extract-status"), $("btn-editor-extract"));
 });
 
 /* --------------------------------------------------------- file loading */
@@ -1479,7 +1586,7 @@ $("btn-go").addEventListener("click", () => {
 $("path-input").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-go").click(); });
 
 /* debug/support hook — inspect state from the console, no behaviour change */
-window.__ime = { state, isShell, recClass, recName, selectElementByRec, setBase, togglePart, hideRecs, unhideAll };
+window.__ime = { state, editor, isShell, recClass, recName, selectElementByRec, setBase, togglePart, toggleLayer, layerSet, hideRecs, unhideAll, editorPaste, itemMatrixIFC, editorUpdateItem, renderEditorPanel };
 
 /* ------------------------------------------------------------- startup */
 renderRecents();

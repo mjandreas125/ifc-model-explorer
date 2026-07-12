@@ -562,6 +562,64 @@ class Model:
             ifcopenshell.api.run("geometry.edit_object_placement", patched, product=element, matrix=matrix, is_si=True)
         patched.write(str(out_path))
 
+    @staticmethod
+    def _apply_deforms(source: Any, patched: Any, deforms: dict[str, list[float]]) -> None:
+        """Re-bake elements as transformed surface models (editor resize).
+
+        Recompute each element's world mesh, apply the world-space affine, convert
+        back to the element's local coordinates and replace its Body representation
+        with an IfcFaceBasedSurfaceModel (valid in IFC2X3 and IFC4).
+        """
+        import ifcopenshell.util.placement as placement_util
+        import ifcopenshell.util.unit as unit_util
+
+        settings = ifcopenshell.geom.settings()
+        settings.set("use-world-coords", True)
+        unit_scale = unit_util.calculate_unit_scale(patched)  # metres per file unit
+
+        for step_id, flat in deforms.items():
+            try:
+                src_entity = source.by_id(int(step_id))
+                guid = lib.plain(getattr(src_entity, "GlobalId", ""))
+                element = patched.by_guid(guid)
+            except Exception:
+                continue
+            if not getattr(element, "Representation", None):
+                continue
+            try:
+                shape = ifcopenshell.geom.create_shape(settings, src_entity)
+            except Exception:
+                continue
+            verts = np.asarray(shape.geometry.verts, dtype=np.float64).reshape(-1, 3)  # world metres
+            faces = np.asarray(shape.geometry.faces, dtype=np.int64).reshape(-1, 3)
+            if not len(verts) or not len(faces):
+                continue
+            affine = np.asarray(flat, dtype=np.float64).reshape(4, 4)  # row-major, IFC world m
+            world_new = verts @ affine[:3, :3].T + affine[:3, 3]       # (N,3) metres
+            world_file = world_new / unit_scale                         # to file units (e.g. mm)
+            placement = placement_util.get_local_placement(element.ObjectPlacement)  # file units
+            inv = np.linalg.inv(placement)
+            local = world_file @ inv[:3, :3].T + inv[:3, 3]             # element-local file units
+
+            points = [patched.create_entity("IfcCartesianPoint", (float(x), float(y), float(z)))
+                      for x, y, z in local]
+            ifc_faces = []
+            for a, b, c in faces:
+                loop = patched.create_entity("IfcPolyLoop", (points[a], points[b], points[c]))
+                bound = patched.create_entity("IfcFaceOuterBound", loop, True)
+                ifc_faces.append(patched.create_entity("IfcFace", (bound,)))
+            face_set = patched.create_entity("IfcConnectedFaceSet", ifc_faces)
+            surface_model = patched.create_entity("IfcFaceBasedSurfaceModel", (face_set,))
+
+            definition = element.Representation
+            reps = list(definition.Representations)
+            body = next((r for r in reps if getattr(r, "RepresentationIdentifier", "") == "Body"), reps[0] if reps else None)
+            context = body.ContextOfItems if body else patched.by_type("IfcGeometricRepresentationContext")[0]
+            new_body = patched.create_entity(
+                "IfcShapeRepresentation", context, "Body", "SurfaceModel", (surface_model,))
+            definition.Representations = tuple(
+                r for r in reps if getattr(r, "RepresentationIdentifier", "") != "Body") + (new_body,)
+
     def ensure_ifc(self, status=None) -> Any:
         with self.lock:
             if self.ifc is None:
@@ -571,11 +629,14 @@ class Model:
             return self.ifc
 
     def extract(self, element_ids: list[int], name: Optional[str], out_dir: Optional[Path], status,
-                moves: Optional[dict[str, list[float]]] = None) -> dict[str, Any]:
+                moves: Optional[dict[str, list[float]]] = None,
+                deforms: Optional[dict[str, list[float]]] = None) -> dict[str, Any]:
         """Export an arbitrary set of source elements (by STEP id) as one exact IFC subset.
 
-        moves: optional {stepId: [dx, dy, dz]} world offsets in METRES (editor tab) —
-        applied to each element's ObjectPlacement in the exported file.
+        moves: optional {stepId: [dx, dy, dz]} world offsets in METRES (editor) — applied
+        to each element's ObjectPlacement in the exported file.
+        deforms: optional {stepId: 16 floats} row-major 4x4 affine in IFC world coords (metres)
+        — the element's geometry is recomputed, transformed and re-baked (editor resize).
         """
         if not element_ids:
             raise ValueError("empty selection")
@@ -603,9 +664,14 @@ class Model:
         package = SimpleNamespace(members=set(members))
         patched = lib.export_package(model, package, out_path)
 
+        if deforms:
+            status("deform", 62, f"Muudan {len(deforms)} osa geomeetriat …")
+            self._apply_deforms(model, patched, deforms)
         if moves:
             status("moves", 70, f"Rakendan {len(moves)} osa nihked …")
             self._apply_moves(model, patched, moves, out_path)
+        elif deforms:
+            patched.write(str(out_path))
 
         status("validate", 85, "Kontrollin tulemust …")
         expected = {lib.plain(getattr(e, "GlobalId", "")) for e in members if lib.plain(getattr(e, "GlobalId", ""))}

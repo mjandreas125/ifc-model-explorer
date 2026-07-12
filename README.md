@@ -35,8 +35,10 @@ relationships at all** (like most Tekla exports).
 - 📏 **Capture radius slider**: bulk-add everything within N cm of the selection.
 - 🙈 **Hide parts** (H / right-click) that block the view, with full **undo/redo** (Ctrl+Z / Ctrl+Y).
 - ✂️ **Editor tab**: Ctrl+C any selection, paste it into an empty workspace, delete parts,
-  **drag parts to new positions** (Shift = vertical) — and save the result as a new IFC.
-  Moves are written back into real `IfcLocalPlacement`s, so the exported file is valid BIM data.
+  **drag parts to new positions** (Alt = vertical), **stretch/shorten a part along its axis**
+  (Shift+drag its end — e.g. trim protruding rebar) — and save the result as a new IFC.
+  Moves are written back into real `IfcLocalPlacement`s; resized parts are re-baked as valid
+  surface geometry — so the exported file is valid BIM data either way.
 - ✅ **Exact, validated exports**: every exported IFC is an exact subset of the source file —
   GlobalIds, psets, materials, styles and spatial structure preserved — and is re-opened and
   checked (GUID and reinforcement counts) after writing.
@@ -90,8 +92,10 @@ Python 3.10 · IfcOpenShell 0.8 · FastAPI · three.js · без внешних 
 |---|---|
 | Click shell | select whole element with all internals |
 | Click rebar/part | select that single part |
+| Alt+Click | select the whole layer (entire mesh / reinforcement layer) |
 | Double-click | select whole element (from any part) |
 | Ctrl+Click | add/remove a single part |
+| Ctrl+Alt+Click | add/remove a whole layer |
 | Right-click | context menu (hide, select, copy) |
 | Del | remove selected parts from view + export |
 | H | hide selection |
@@ -100,7 +104,8 @@ Python 3.10 · IfcOpenShell 0.8 · FastAPI · three.js · без внешних 
 | F | fit view |
 | Ctrl+C / Ctrl+V | copy selection → paste in editor |
 | Ctrl+Z / Ctrl+Y | undo / redo |
-| Drag / Shift+drag | move parts (editor) |
+| Drag / Alt+drag | move parts horizontally / vertically (editor) |
+| Shift+drag end | stretch or shorten a part along its axis (editor) |
 
 ## License
 
