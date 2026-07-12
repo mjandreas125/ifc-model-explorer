@@ -209,6 +209,8 @@ input, select { font: inherit; }
   border: 1px solid #c6cfd9; border-radius: 6px; background: #fbfcfe; font-size: 12.5px;
 }
 .btn-mini { font-size: 12px; padding: 4px 9px; margin: 2px 0 6px; width: 100%; text-align: left; color: #33507a; }
+.btn-remove { margin-top: 8px; color: #a13636; border-color: #e2c2c2; background: #fbf3f3; }
+.btn-remove:hover { background: #f6e6e6; border-color: #d9a5a5; }
 .extract-status {
   margin-top: 9px; font-size: 12.5px; border-radius: 7px; padding: 8px 10px;
   background: #f2f6fa; border: 1px solid #d7e0ea; color: #33507a;

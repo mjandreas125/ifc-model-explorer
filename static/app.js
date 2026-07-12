@@ -45,11 +45,15 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPrefere
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xeef1f4);
-const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 5000);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.02, 4000);
 camera.position.set(30, 25, 30);
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
 controls.dampingFactor = 0.12;
+controls.zoomToCursor = true;       // zoom toward the cursor — fast close-up inspection
+controls.zoomSpeed = 1.35;
+controls.minDistance = 0.05;
+controls.maxDistance = 3000;
 
 scene.add(new THREE.HemisphereLight(0xffffff, 0xb9c0c8, 0.95));
 const sun = new THREE.DirectionalLight(0xffffff, 0.75);
@@ -156,6 +160,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function recClass(r) { return state.meta.classTable[state.rec.classIdx[r]] || ""; }
 function recName(r) { return state.names.get(state.rec.ids[r]) || recClass(r).replace(/^Ifc/, ""); }
 function recMark(r) { const p = state.rec.pkg[r]; return p >= 0 ? (state.packages[p]?.mark || "") : ""; }
+// "shell" = the concrete/host body (not rebar, mesh, embed, plate, member).
+// Clicking a shell grabs the whole element; clicking anything else = that one part.
+function isShell(r) { return !CAPTURE_CLASSES.has(recClass(r)); }
 
 /* ------------------------------------------------------------- mesh build */
 function disposeOverlay(obj) {
@@ -670,21 +677,18 @@ canvas.addEventListener("pointerup", (e) => {
   downPos = null;
   if (moved > 5 || e.button !== 0 || state.isolated) return;
   const hit = pick(e);
-  if (e.ctrlKey || e.metaKey) {
-    if (hit) toggleElement(hit.rec);
+  if (e.ctrlKey || e.metaKey || e.altKey) {
+    if (hit) togglePart(hit.rec);            // Ctrl/Alt = add/remove a SINGLE part
     return;
   }
-  if (e.altKey) {
-    if (hit) togglePart(hit.rec);
-    return;
-  }
-  if (hit) selectElementByRec(hit.rec);     // click = whole element WITH internals
-  else setBase([]);
+  if (!hit) { setBase([]); return; }
+  if (isShell(hit.rec)) selectElementByRec(hit.rec); // shell → whole element + internals
+  else setBase([hit.rec], { fit: false });           // rebar/embed → just this one part
 });
 canvas.addEventListener("dblclick", (e) => {
   if (tab === "editor") return;
   const hit = pick(e);
-  if (hit) setBase([hit.rec], { fit: false }); // double click = drill to single part
+  if (hit) selectElementByRec(hit.rec);      // double click = whole element from anywhere
 });
 
 /* --------------------------------------------------------- context menu */
@@ -794,7 +798,11 @@ window.addEventListener("keydown", (e) => {
   if (ctrl && (e.key.toLowerCase() === "y" || (e.shiftKey && e.key.toLowerCase() === "z"))) { e.preventDefault(); if (tab !== "editor") redo(); return; }
   if (ctrl && e.key.toLowerCase() === "c") { if (tab !== "editor") { e.preventDefault(); copySelection(); } return; }
   if (ctrl && e.key.toLowerCase() === "v") { if (tab === "editor") { e.preventDefault(); editorPaste(); } else if (clipboard.length) { setTab("editor"); editorPaste(); } return; }
-  if (e.key === "Delete") { if (tab === "editor") editorDelete(); return; }
+  if (e.key === "Delete" || e.key === "Backspace") {
+    if (tab === "editor") editorDelete();
+    else if (state.selected.size) hideRecs([...state.selected]);
+    return;
+  }
   if (e.key === "Escape") { tab === "editor" ? editorSelect([]) : setBase([]); return; }
   if (e.key === "f" || e.key === "F") { fitAll(); return; }
   if (tab === "editor") return;
@@ -1034,6 +1042,7 @@ function renderDetail() {
   $("btn-extract").disabled = false;
 }
 $("btn-close-detail").addEventListener("click", () => setBase([]));
+$("btn-remove").addEventListener("click", () => { if (state.selected.size) hideRecs([...state.selected]); });
 
 /* ------------------------------------------------------------- toolbar */
 function toggleIsolate() {
@@ -1468,6 +1477,9 @@ $("btn-go").addEventListener("click", () => {
   else browse(value);
 });
 $("path-input").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-go").click(); });
+
+/* debug/support hook — inspect state from the console, no behaviour change */
+window.__ime = { state, isShell, recClass, recName, selectElementByRec, setBase, togglePart, hideRecs, unhideAll };
 
 /* ------------------------------------------------------------- startup */
 renderRecents();

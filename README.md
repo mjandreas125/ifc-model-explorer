@@ -24,8 +24,10 @@ relationships at all** (like most Tekla exports).
   pure geometry (an inflated-bbox containment rule taken from a production-tested extraction
   pipeline).
 - 🖱 **Trimble-style 3D navigation**: hover highlights the part under the cursor with an orange
-  outline; click selects a whole element **with everything inside it**; double-click drills down
-  to a single part; Ctrl adds/removes elements, Alt single parts; right-click menu for hide/select.
+  outline; **clicking the concrete shell** selects the whole element with everything inside it,
+  **clicking a rebar/embed** selects just that one part; Ctrl+click builds a custom multi-part
+  selection; double-click grabs the whole element from anywhere; Delete removes parts; right-click
+  menu for hide/select/copy. Zoom is cursor-centered for fast close-up inspection.
 - 🩻 **X-ray & isolate** (they combine): make all concrete ghost-transparent and click *through*
   it to grab reinforcement directly.
 - 🤝 **"Touching / nearby" suggestions**: the side panel lists parts that touch the selection
@@ -86,18 +88,18 @@ Python 3.10 · IfcOpenShell 0.8 · FastAPI · three.js · без внешних 
 
 | Key | Action |
 |---|---|
-| Click | select element with all internals |
-| Double-click | select single part |
-| Ctrl+Click | add/remove element |
-| Alt+Click | add/remove single part |
+| Click shell | select whole element with all internals |
+| Click rebar/part | select that single part |
+| Double-click | select whole element (from any part) |
+| Ctrl+Click | add/remove a single part |
 | Right-click | context menu (hide, select, copy) |
+| Del | remove selected parts from view + export |
 | H | hide selection |
 | X | x-ray concrete |
 | I | isolate selection |
 | F | fit view |
 | Ctrl+C / Ctrl+V | copy selection → paste in editor |
 | Ctrl+Z / Ctrl+Y | undo / redo |
-| Del | delete parts (editor) |
 | Drag / Shift+drag | move parts (editor) |
 
 ## License
