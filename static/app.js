@@ -20,6 +20,8 @@ const state = {
   excluded: new Set(),
   selected: new Set(),
   hidden: new Set(),
+  resizes: new Map(),     // rec -> {axis, factor, pivot} — in-place length edits
+  detached: new Set(),    // recs pulled out of the merged mesh into a per-part overlay
   radius: 0,
   isolated: false,
   xray: false,
@@ -29,6 +31,8 @@ const state = {
   redo: [],
 };
 let clipboard = [];
+const resizeMeshes = new Map();   // rec -> THREE.Mesh (per-part overlay for resizing)
+let projResize = null;            // active in-place resize drag
 
 const INTERNAL_CLASSES = new Set([
   "IfcReinforcingBar", "IfcReinforcingMesh", "IfcTendon",
@@ -66,6 +70,8 @@ scene.add(fillLight);
 const root = new THREE.Group();          // project view; IFC Z-up -> three Y-up
 root.rotation.x = -Math.PI / 2;
 scene.add(root);
+const resizeGroup = new THREE.Group();   // per-part overlays for in-place resizing
+root.add(resizeGroup);
 const editorRoot = new THREE.Group();    // editor tab
 editorRoot.rotation.x = -Math.PI / 2;
 editorRoot.visible = false;
@@ -87,6 +93,10 @@ const matHoverLine = new THREE.LineBasicMaterial({ color: 0xff9500, depthTest: f
 const matEditorSel = new THREE.MeshPhongMaterial({
   vertexColors: true, flatShading: true, shininess: 10,
   emissive: 0x2e6fd0, emissiveIntensity: 0.35,
+});
+const matResizeSel = new THREE.MeshPhongMaterial({   // a detached, selected, resizable part
+  vertexColors: true, flatShading: true, shininess: 12,
+  emissive: 0xffaa00, emissiveIntensity: 0.4,
 });
 
 let selFillMesh = null, selLineMesh = null, hoverLineMesh = null;
@@ -177,13 +187,61 @@ function clearModel() {
   selFillMesh = disposeOverlay(selFillMesh);
   selLineMesh = disposeOverlay(selLineMesh);
   hoverLineMesh = disposeOverlay(hoverLineMesh);
+  for (const mesh of resizeMeshes.values()) { resizeGroup.remove(mesh); mesh.geometry.dispose(); }
+  resizeMeshes.clear();
   state.boxes.clear();
   state.base.clear(); state.excluded.clear(); state.selected.clear(); state.hidden.clear();
+  state.resizes.clear(); state.detached.clear();
   state.undo = []; state.redo = [];
   state.hoverRec = -1;
   edgeCache.clear();
   editorClear(true);
   if (grid) { scene.remove(grid); grid = null; }
+}
+
+/* ---------------------------------------------------- in-place resize */
+function resizeMatrixIFC(rec) {
+  const m = new THREE.Matrix4();
+  const rz = state.resizes.get(rec);
+  if (rz) {
+    const s = [1, 1, 1]; s[rz.axis] = rz.factor;
+    const t = [0, 0, 0]; t[rz.axis] = rz.pivot * (1 - rz.factor);
+    m.set(s[0], 0, 0, t[0], 0, s[1], 0, t[1], 0, 0, s[2], t[2], 0, 0, 0, 1);
+  }
+  return m;
+}
+function ensureResizeMesh(rec) {
+  if (resizeMeshes.has(rec)) return resizeMeshes.get(rec);
+  state.detached.add(rec);
+  const idx = state.recToEntry[rec];
+  if (idx >= 0) rebuildEntry(state.meshEntries[idx]);
+  const { geometry } = geometryFromRecs([rec], true, false);
+  const mesh = new THREE.Mesh(geometry, matBase);
+  mesh.matrixAutoUpdate = false;
+  mesh.userData.rec = rec;
+  resizeGroup.add(mesh);
+  resizeMeshes.set(rec, mesh);
+  updateResizeMesh(rec);
+  return mesh;
+}
+function updateResizeMesh(rec) {
+  const mesh = resizeMeshes.get(rec);
+  if (mesh) { mesh.matrix.copy(resizeMatrixIFC(rec)); mesh.matrixWorldNeedsUpdate = true; }
+}
+function clearResize(rec) {
+  const mesh = resizeMeshes.get(rec);
+  if (mesh) { resizeGroup.remove(mesh); mesh.geometry.dispose(); resizeMeshes.delete(rec); }
+  state.resizes.delete(rec);
+  state.detached.delete(rec);
+  const idx = state.recToEntry[rec];
+  if (idx >= 0) rebuildEntry(state.meshEntries[idx]);
+}
+// keep overlays in sync with the current selection/hidden state after undo etc.
+function syncResizeMeshes() {
+  for (const rec of [...resizeMeshes.keys()]) {
+    if (!state.resizes.has(rec)) clearResize(rec);
+  }
+  for (const rec of state.resizes.keys()) { ensureResizeMesh(rec); updateResizeMesh(rec); }
 }
 
 function geometryFromRecs(recList, withColors = true, withTriMap = false) {
@@ -217,7 +275,7 @@ function geometryFromRecs(recList, withColors = true, withTriMap = false) {
 }
 
 function rebuildEntry(entry) {
-  const visible = entry.recsAll.filter((r) => !state.hidden.has(r));
+  const visible = entry.recsAll.filter((r) => !state.hidden.has(r) && !state.detached.has(r));
   entry.mesh.geometry.dispose();
   if (!visible.length) {
     entry.mesh.geometry = new THREE.BufferGeometry();
@@ -400,11 +458,15 @@ function elementSet(rec) {
 }
 
 /* ----------------------------------------------------------- history */
-function pushHistory() {
-  state.undo.push({
+function historySnapshot() {
+  return {
     base: new Set(state.base), excluded: new Set(state.excluded),
     hidden: new Set(state.hidden), radius: state.radius,
-  });
+    resizes: new Map([...state.resizes].map(([r, v]) => [r, { ...v }])),
+  };
+}
+function pushHistory() {
+  state.undo.push(historySnapshot());
   if (state.undo.length > 60) state.undo.shift();
   state.redo = [];
 }
@@ -414,9 +476,11 @@ function applySnapshot(s) {
   state.excluded = new Set(s.excluded);
   state.hidden = new Set(s.hidden);
   state.radius = s.radius;
+  state.resizes = new Map([...(s.resizes || new Map())].map(([r, v]) => [r, { ...v }]));
   $("radius").value = Math.round(state.radius * 100);
   syncRadiusLabel();
   if (hiddenChanged) rebuildHidden();
+  syncResizeMeshes();
   refreshSelection({ fit: false });
 }
 function setsEqual(a, b) {
@@ -426,12 +490,12 @@ function setsEqual(a, b) {
 }
 function undo() {
   if (!state.undo.length) return;
-  state.redo.push({ base: new Set(state.base), excluded: new Set(state.excluded), hidden: new Set(state.hidden), radius: state.radius });
+  state.redo.push(historySnapshot());
   applySnapshot(state.undo.pop());
 }
 function redo() {
   if (!state.redo.length) return;
-  state.undo.push({ base: new Set(state.base), excluded: new Set(state.excluded), hidden: new Set(state.hidden), radius: state.radius });
+  state.undo.push(historySnapshot());
   applySnapshot(state.redo.pop());
 }
 
@@ -482,10 +546,13 @@ function refreshSelection({ fit = false } = {}) {
   for (const m of state.isolatedMeshes) disposeOverlay(m.mesh);
   state.isolatedMeshes = [];
   if (state.selected.size) {
-    const recList = [...state.selected];
+    // detached (resized) parts are drawn by their own overlay mesh — don't outline
+    // them here with the original geometry, it would show the wrong (old) shape
+    const recList = [...state.selected].filter((r) => !state.detached.has(r));
     let tris = 0;
     for (const r of recList) tris += state.rec.iCnt[r] / 3;
-    if (state.isolated) {
+    if (!recList.length) { /* only resized parts selected — overlay shows highlight */ }
+    else if (state.isolated) {
       // isolate keeps shell and internals apart so Röntgen works inside it too
       const shellRecs = recList.filter((r) => !INTERNAL_CLASSES.has(recClass(r)));
       const innerRecs = recList.filter((r) => INTERNAL_CLASSES.has(recClass(r)));
@@ -503,7 +570,7 @@ function refreshSelection({ fit = false } = {}) {
       selFillMesh.raycast = () => {};
       root.add(selFillMesh);
     }
-    if (tris < 400000) {
+    if (recList.length && tris < 400000) {
       const { geometry } = geometryFromRecs(recList, false, false);
       const edges = new THREE.EdgesGeometry(geometry, 28);
       geometry.dispose();
@@ -648,6 +715,11 @@ function applyVisual() {
     m.mesh.material = (m.part === "shell" && state.xray) ? matGhost : matBase;
     m.mesh.renderOrder = m.mesh.material === matGhost ? 3 : 0;
   }
+  for (const [rec, mesh] of resizeMeshes) {
+    mesh.visible = !state.hidden.has(rec) && (!state.isolated || state.selected.has(rec));
+    mesh.material = state.selected.has(rec) ? matResizeSel : matBase;
+    mesh.renderOrder = 1;
+  }
   $("btn-xray").classList.toggle("on", state.xray);
   $("btn-isolate").classList.toggle("on", state.isolated);
 }
@@ -685,20 +757,92 @@ function pick(e) {
     if (state.xray && entry.mesh.material === matGhost) continue;
     targets.push(entry.mesh);
   }
+  for (const mesh of resizeMeshes.values()) if (mesh.visible) targets.push(mesh);
   const hits = raycaster.intersectObjects(targets, false);
   const hit = hits[0];
   if (!hit) return null;
+  if (hit.object.parent === resizeGroup) {
+    return { entry: null, rec: hit.object.userData.rec, point: hit.point };
+  }
   const entry = state.meshEntries.find((en) => en.mesh === hit.object);
   if (!entry) return null;
   return { entry, rec: resolveRec(entry, hit.faceIndex), point: hit.point };
 }
 
+// Longest IFC axis of a part + which end the click grabbed (far end stays fixed)
+function resizeGrab(rec, pointWorld) {
+  const box = recBox(rec);
+  const size = box.getSize(new THREE.Vector3());
+  const axis = size.x >= size.y && size.x >= size.z ? 0 : (size.y >= size.z ? 1 : 2);
+  root.updateMatrixWorld(true);
+  const ifcPoint = pointWorld.clone().applyMatrix4(new THREE.Matrix4().copy(root.matrixWorld).invert());
+  const lo = box.min.getComponent(axis), hi = box.max.getComponent(axis);
+  const nearHi = Math.abs(ifcPoint.getComponent(axis) - hi) < Math.abs(ifcPoint.getComponent(axis) - lo);
+  return { axis, pivot: nearHi ? lo : hi, origEnd: nearHi ? hi : lo, center: box.getCenter(new THREE.Vector3()) };
+}
+function rayCoordAlongAxis(grab) {
+  const ray = raycaster.ray.clone().applyMatrix4(new THREE.Matrix4().copy(root.matrixWorld).invert());
+  const pivotVec = grab.center.clone(); pivotVec.setComponent(grab.axis, grab.pivot);
+  const ro = ray.origin, rd = ray.direction;
+  const w0 = ro.clone().sub(pivotVec);
+  const a = rd.dot(rd), b = rd.getComponent(grab.axis), dd = rd.dot(w0), e2 = w0.getComponent(grab.axis);
+  const denom = a - b * b;
+  const tc = Math.abs(denom) < 1e-9 ? e2 : (a * e2 - b * dd) / denom;
+  return grab.pivot + tc;
+}
+
+// Capture phase: decide the gesture BEFORE OrbitControls sees the pointerdown, so
+// a resize/move drag can disable the camera in time (else the camera "wins").
+canvas.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0) return;
+  let grab = false;
+  if (tab === "editor") {
+    const hit = editorPick(e);
+    grab = !!(hit && editor.selected.has(hit.object.userData.rec));
+  } else if (e.shiftKey && state.selected.size === 1 && !state.isolated) {
+    const hit = pick(e);
+    grab = !!(hit && hit.rec === [...state.selected][0]);
+  }
+  if (grab) controls.enabled = false;
+}, true);
+
 let downPos = null;
 canvas.addEventListener("pointerdown", (e) => {
   hideCtxMenu();
   if (tab === "editor") { editorPointerDown(e); return; }
+  if (e.button === 0 && e.shiftKey && state.selected.size === 1 && !state.isolated) {
+    const rec = [...state.selected][0];
+    const hit = pick(e);
+    if (hit && hit.rec === rec) {           // start in-place length change
+      pushHistory();
+      ensureResizeMesh(rec);
+      projResize = { rec, ...resizeGrab(rec, hit.point), moved: false };
+      applyVisual();
+      return;
+    }
+  }
   downPos = [e.clientX, e.clientY];
 });
+canvas.addEventListener("pointermove", (e) => {
+  if (!projResize || tab === "editor") return;
+  setPointerFromEvent(e);
+  const grabbed = rayCoordAlongAxis(projResize);
+  let factor = (grabbed - projResize.pivot) / (projResize.origEnd - projResize.pivot);
+  factor = Math.max(0.05, Math.min(20, factor));
+  state.resizes.set(projResize.rec, { axis: projResize.axis, factor, pivot: projResize.pivot });
+  updateResizeMesh(projResize.rec);
+  projResize.moved = true;
+  renderDetail();
+});
+canvas.addEventListener("pointerup", () => {
+  if (projResize) {
+    if (!projResize.moved) { state.undo.pop(); if (!state.resizes.has(projResize.rec)) clearResize(projResize.rec); }
+    projResize = null;
+    refreshSelection({ fit: false });
+  }
+  if (!editor.drag) controls.enabled = true;   // never leave the camera stuck off
+}, true);
+
 canvas.addEventListener("pointerup", (e) => {
   if (tab === "editor") { editorPointerUp(e); return; }
   if (!downPos) return;
@@ -791,6 +935,7 @@ function setHover(r) {
 let hoverTimer = 0;
 canvas.addEventListener("pointermove", (e) => {
   if (tab === "editor") { editorPointerMove(e); return; }
+  if (projResize) { $("tooltip").hidden = true; return; }  // resizing in place — no hover
   const now = performance.now();
   if (now - hoverTimer < 60) return;
   hoverTimer = now;
@@ -1033,7 +1178,22 @@ function renderDetail() {
   if (distinct > 1) chips.push(`${distinct} elementi`);
   if (state.radius > 0) chips.push(`haare ${Math.round(state.radius * 100)} cm`);
   if (state.excluded.size) chips.push(`−${state.excluded.size} eemaldatud`);
+  const resizedSel = recs.filter((r) => state.resizes.has(r));
+  if (resizedSel.length === 1) chips.push(`pikkus ${Math.round(state.resizes.get(resizedSel[0]).factor * 100)}%`);
+  else if (resizedSel.length > 1) chips.push(`${resizedSel.length} muudetud pikkust`);
   $("detail-chips").innerHTML = chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("");
+
+  // single-part hint: length editing lives right here in the project view
+  const single = state.selected.size === 1;
+  $("resize-hint").hidden = !single;
+  if (single) {
+    const r = recs[0];
+    $("resize-hint").innerHTML = state.resizes.has(r)
+      ? `Pikkus muudetud → <a href="#" id="reset-resize">taasta algne</a>. Shift+lohista otsa muudab veel.`
+      : `↔ <b>Shift+lohista selle osa otsa</b>, et muuta pikkust (nt lühendada välja ulatuvat armatuuri).`;
+    const reset = $("reset-resize");
+    if (reset) reset.addEventListener("click", (ev) => { ev.preventDefault(); pushHistory(); clearResize(r); refreshSelection({ fit: false }); });
+  }
 
   const box = selectionBox();
   const size = box.getSize(new THREE.Vector3());
@@ -1143,7 +1303,12 @@ async function runExtract(elements, name, opts, statusEl, button) {
 $("btn-extract").addEventListener("click", () => {
   if (!state.selected.size) return;
   const elements = [...state.selected].map((r) => state.rec.ids[r]);
-  runExtract(elements, $("export-name").value.trim() || defaultExportName(), null, $("extract-status"), $("btn-extract"));
+  const deforms = {};
+  for (const r of state.selected) {
+    if (state.resizes.has(r)) deforms[String(state.rec.ids[r])] = matrixRows(resizeMatrixIFC(r));
+  }
+  runExtract(elements, $("export-name").value.trim() || defaultExportName(),
+    { deforms: Object.keys(deforms).length ? deforms : null }, $("extract-status"), $("btn-extract"));
 });
 
 function matrixRows(m) {
@@ -1586,7 +1751,13 @@ $("btn-go").addEventListener("click", () => {
 $("path-input").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-go").click(); });
 
 /* debug/support hook — inspect state from the console, no behaviour change */
-window.__ime = { state, editor, isShell, recClass, recName, selectElementByRec, setBase, togglePart, toggleLayer, layerSet, hideRecs, unhideAll, editorPaste, itemMatrixIFC, editorUpdateItem, renderEditorPanel };
+function screenOf(rec) {
+  root.updateMatrixWorld(true);
+  const c = recBox(rec).getCenter(new THREE.Vector3()).applyMatrix4(root.matrixWorld).project(camera);
+  const rect = canvas.getBoundingClientRect();
+  return { x: rect.left + (c.x * 0.5 + 0.5) * rect.width, y: rect.top + (-c.y * 0.5 + 0.5) * rect.height };
+}
+window.__ime = { state, editor, isShell, recClass, recName, selectElementByRec, setBase, togglePart, toggleLayer, layerSet, hideRecs, unhideAll, editorPaste, itemMatrixIFC, editorUpdateItem, renderEditorPanel, screenOf, resizeMeshes, controls, camera };
 
 /* ------------------------------------------------------------- startup */
 renderRecents();

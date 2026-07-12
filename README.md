@@ -34,11 +34,13 @@ relationships at all** (like most Tekla exports).
   (joints, grout, anchors) with one-click ➕ add — the list unfolds transitively as you add.
 - 📏 **Capture radius slider**: bulk-add everything within N cm of the selection.
 - 🙈 **Hide parts** (H / right-click) that block the view, with full **undo/redo** (Ctrl+Z / Ctrl+Y).
+- ↔ **Resize in place**: select a single part and **Shift+drag its end** to stretch or shorten
+  it along its axis (e.g. trim rebar poking out of the concrete) right in the project view. The
+  camera stays put during the drag; the change is baked into valid IFC surface geometry on export.
 - ✂️ **Editor tab**: Ctrl+C any selection, paste it into an empty workspace, delete parts,
-  **drag parts to new positions** (Alt = vertical), **stretch/shorten a part along its axis**
-  (Shift+drag its end — e.g. trim protruding rebar) — and save the result as a new IFC.
-  Moves are written back into real `IfcLocalPlacement`s; resized parts are re-baked as valid
-  surface geometry — so the exported file is valid BIM data either way.
+  **drag parts to new positions** (Alt = vertical) and resize them (Shift+drag end) — then save
+  the result as a new IFC. Moves are written back into real `IfcLocalPlacement`s; resized parts
+  are re-baked as valid surface geometry — so the exported file is valid BIM data either way.
 - ✅ **Exact, validated exports**: every exported IFC is an exact subset of the source file —
   GlobalIds, psets, materials, styles and spatial structure preserved — and is re-opened and
   checked (GUID and reinforcement counts) after writing.
@@ -104,8 +106,8 @@ Python 3.10 · IfcOpenShell 0.8 · FastAPI · three.js · без внешних 
 | F | fit view |
 | Ctrl+C / Ctrl+V | copy selection → paste in editor |
 | Ctrl+Z / Ctrl+Y | undo / redo |
+| Shift+drag end | stretch / shorten the selected part along its axis (project + editor) |
 | Drag / Alt+drag | move parts horizontally / vertically (editor) |
-| Shift+drag end | stretch or shorten a part along its axis (editor) |
 
 ## License
 
