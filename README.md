@@ -34,9 +34,13 @@ relationships at all** (like most Tekla exports).
   (joints, grout, anchors) with one-click ➕ add — the list unfolds transitively as you add.
 - 📏 **Capture radius slider**: bulk-add everything within N cm of the selection.
 - 🙈 **Hide parts** (H / right-click) that block the view, with full **undo/redo** (Ctrl+Z / Ctrl+Y).
-- ↔ **Resize in place**: select a single part and **Shift+drag its end** to stretch or shorten
-  it along its axis (e.g. trim rebar poking out of the concrete) right in the project view. The
-  camera stays put during the drag; the change is baked into valid IFC surface geometry on export.
+- 🗂 **Multiple files at once**: open several IFC files as **document tabs** (like a browser) —
+  click to switch, × to close, ＋ to open more. Each tab keeps its own selection and camera.
+- ✂️ **Cut / stretch a part in place**: select a single part and **Shift+drag its end**. Default
+  is a clean **cut** (removes material, no shape distortion — ideal for bent rebar poking out of
+  the concrete); switch to **stretch** for a scale. One click **"cut at the concrete edge"** trims
+  a protruding bar flush with the concrete. The camera stays put during the drag; the edit is
+  baked into valid IFC surface geometry on export.
 - ✂️ **Editor tab**: Ctrl+C any selection, paste it into an empty workspace, delete parts,
   **drag parts to new positions** (Alt = vertical) and resize them (Shift+drag end) — then save
   the result as a new IFC. Moves are written back into real `IfcLocalPlacement`s; resized parts

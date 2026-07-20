@@ -20,7 +20,9 @@ const state = {
   excluded: new Set(),
   selected: new Set(),
   hidden: new Set(),
-  resizes: new Map(),     // rec -> {axis, factor, pivot} — in-place length edits
+  resizes: new Map(),     // rec -> {axis, factor, pivot} — stretch/shrink (scale)
+  cuts: new Map(),        // rec -> {axis, coord, keepBelow} — trim by a plane (no distortion)
+  endOp: "cut",           // what Shift+drag of an end does: "cut" (trim) or "resize" (stretch)
   detached: new Set(),    // recs pulled out of the merged mesh into a per-part overlay
   radius: 0,
   isolated: false,
@@ -201,7 +203,7 @@ function clearModel() {
   if (grid) { scene.remove(grid); grid = null; }
 }
 
-/* ---------------------------------------------------- in-place resize */
+/* -------------------------------------------- in-place resize / cut */
 function resizeMatrixIFC(rec) {
   const m = new THREE.Matrix4();
   const rz = state.resizes.get(rec);
@@ -212,13 +214,65 @@ function resizeMatrixIFC(rec) {
   }
   return m;
 }
+function isEdited(rec) { return state.resizes.has(rec) || state.cuts.has(rec); }
+// Clip a part's triangles by an axis plane, keeping the pivot side (== the export).
+function clipRecGeometry(rec, cut) {
+  const { vOff, vCnt, iOff, iCnt, colors } = state.rec;
+  const sv = vOff[rec], nv = vCnt[rec], si = iOff[rec], ni = iCnt[rec];
+  const pos = state.positions, idxAll = state.indices;
+  const axis = cut.axis, coord = cut.coord, keepBelow = cut.keepBelow;
+  const sd = new Float32Array(nv);
+  for (let k = 0; k < nv; k++) { const x = pos[(sv + k) * 3 + axis]; sd[k] = keepBelow ? (x - coord) : (coord - x); }
+  const outPos = [], outCol = [], outIdx = [], map = new Map();
+  const cr = colors[rec * 3], cg = colors[rec * 3 + 1], cb = colors[rec * 3 + 2];
+  const vid = (p) => {
+    const key = p[0].toFixed(5) + "," + p[1].toFixed(5) + "," + p[2].toFixed(5);
+    let i = map.get(key);
+    if (i === undefined) { i = outPos.length / 3; map.set(key, i); outPos.push(p[0], p[1], p[2]); outCol.push(cr, cg, cb); }
+    return i;
+  };
+  for (let t = si; t < si + ni; t += 3) {
+    const li = [idxAll[t] - sv, idxAll[t + 1] - sv, idxAll[t + 2] - sv];
+    const P = (j) => [pos[(sv + li[j]) * 3], pos[(sv + li[j]) * 3 + 1], pos[(sv + li[j]) * 3 + 2]];
+    const S = (j) => sd[li[j]];
+    let poly;
+    const keep = [0, 1, 2].filter((j) => S(j) <= 1e-7);
+    if (keep.length === 3) poly = [P(0), P(1), P(2)];
+    else if (keep.length === 0) continue;
+    else {
+      poly = [];
+      for (let j = 0; j < 3; j++) {
+        const A = P(j), B = P((j + 1) % 3), sa = S(j), sb = S((j + 1) % 3);
+        if (sa <= 1e-7) poly.push(A);
+        if ((sa < 0) !== (sb < 0) && Math.abs(sa - sb) > 1e-9) {
+          const f = sa / (sa - sb);
+          poly.push([A[0] + f * (B[0] - A[0]), A[1] + f * (B[1] - A[1]), A[2] + f * (B[2] - A[2])]);
+        }
+      }
+      if (poly.length < 3) continue;
+    }
+    const ids = poly.map(vid);
+    for (let k = 1; k < ids.length - 1; k++) outIdx.push(ids[0], ids[k], ids[k + 1]);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(outPos), 3));
+  g.setAttribute("color", new THREE.BufferAttribute(new Uint8Array(outCol), 3, true));
+  g.setIndex(outIdx);
+  g.computeBoundingBox(); g.computeBoundingSphere();
+  return g;
+}
+// world plane [ax,ay,az,d] for the cut, keep n·x <= d (matches engine _apply_cuts)
+function cutPlaneWorld(cut) {
+  const n = [0, 0, 0]; n[cut.axis] = cut.keepBelow ? 1 : -1;
+  const d = cut.keepBelow ? cut.coord : -cut.coord;
+  return [n[0], n[1], n[2], d];
+}
 function ensureResizeMesh(rec) {
   if (resizeMeshes.has(rec)) return resizeMeshes.get(rec);
   state.detached.add(rec);
   const idx = state.recToEntry[rec];
   if (idx >= 0) rebuildEntry(state.meshEntries[idx]);
-  const { geometry } = geometryFromRecs([rec], true, false);
-  const mesh = new THREE.Mesh(geometry, matBase);
+  const mesh = new THREE.Mesh(new THREE.BufferGeometry(), matBase);
   mesh.matrixAutoUpdate = false;
   mesh.userData.rec = rec;
   resizeGroup.add(mesh);
@@ -228,22 +282,57 @@ function ensureResizeMesh(rec) {
 }
 function updateResizeMesh(rec) {
   const mesh = resizeMeshes.get(rec);
-  if (mesh) { mesh.matrix.copy(resizeMatrixIFC(rec)); mesh.matrixWorldNeedsUpdate = true; }
+  if (!mesh) return;
+  mesh.geometry.dispose();
+  const cut = state.cuts.get(rec);
+  if (cut) {
+    mesh.geometry = clipRecGeometry(rec, cut);   // trimmed geometry, no scale
+    mesh.matrix.identity();
+  } else {
+    mesh.geometry = geometryFromRecs([rec], true, false).geometry;
+    mesh.matrix.copy(resizeMatrixIFC(rec));       // original geometry + scale
+  }
+  mesh.matrixWorldNeedsUpdate = true;
 }
 function clearResize(rec) {
   const mesh = resizeMeshes.get(rec);
   if (mesh) { resizeGroup.remove(mesh); mesh.geometry.dispose(); resizeMeshes.delete(rec); }
   state.resizes.delete(rec);
+  state.cuts.delete(rec);
   state.detached.delete(rec);
   const idx = state.recToEntry[rec];
   if (idx >= 0) rebuildEntry(state.meshEntries[idx]);
 }
-// keep overlays in sync with the current selection/hidden state after undo etc.
+// keep overlays in sync after undo / tab restore etc.
 function syncResizeMeshes() {
   for (const rec of [...resizeMeshes.keys()]) {
-    if (!state.resizes.has(rec)) clearResize(rec);
+    if (!isEdited(rec)) clearResize(rec);
   }
-  for (const rec of state.resizes.keys()) { ensureResizeMesh(rec); updateResizeMesh(rec); }
+  for (const rec of new Set([...state.resizes.keys(), ...state.cuts.keys()])) { ensureResizeMesh(rec); updateResizeMesh(rec); }
+}
+// trim a part flush with the concrete edge it pokes out of
+function cutAtConcrete(rec) {
+  const pkg = state.rec.pkg[rec];
+  if (pkg < 0) { toast("See osa ei kuulu ühegi elemendi külge"); return; }
+  const box = new THREE.Box3();
+  let found = false;
+  for (let r = 0; r < state.rec.count; r++) {
+    if (state.rec.pkg[r] === pkg && isShell(r) && !state.hidden.has(r)) { box.union(recBox(r)); found = true; }
+  }
+  if (!found) { toast("Betooni ei leitud"); return; }
+  const bar = recBox(rec);
+  const size = bar.getSize(new THREE.Vector3());
+  const axis = size.x >= size.y && size.x >= size.z ? 0 : (size.y >= size.z ? 1 : 2);
+  const overHi = bar.max.getComponent(axis) - box.max.getComponent(axis);
+  const overLo = box.min.getComponent(axis) - bar.min.getComponent(axis);
+  if (Math.max(overHi, overLo) < 0.003) { toast("Osa ei ulatu betoonist märgatavalt välja"); return; }
+  pushHistory();
+  ensureResizeMesh(rec);
+  if (overHi >= overLo) state.cuts.set(rec, { axis, coord: box.max.getComponent(axis), keepBelow: true });
+  else state.cuts.set(rec, { axis, coord: box.min.getComponent(axis), keepBelow: false });
+  updateResizeMesh(rec);
+  refreshSelection({ fit: false });
+  toast("Lõigatud betooni servani");
 }
 
 function geometryFromRecs(recList, withColors = true, withTriMap = false) {
@@ -465,6 +554,7 @@ function historySnapshot() {
     base: new Set(state.base), excluded: new Set(state.excluded),
     hidden: new Set(state.hidden), radius: state.radius,
     resizes: new Map([...state.resizes].map(([r, v]) => [r, { ...v }])),
+    cuts: new Map([...state.cuts].map(([r, v]) => [r, { ...v }])),
   };
 }
 function pushHistory() {
@@ -479,6 +569,7 @@ function applySnapshot(s) {
   state.hidden = new Set(s.hidden);
   state.radius = s.radius;
   state.resizes = new Map([...(s.resizes || new Map())].map(([r, v]) => [r, { ...v }]));
+  state.cuts = new Map([...(s.cuts || new Map())].map(([r, v]) => [r, { ...v }]));
   $("radius").value = Math.round(state.radius * 100);
   syncRadiusLabel();
   if (hiddenChanged) rebuildHidden();
@@ -818,7 +909,7 @@ canvas.addEventListener("pointerdown", (e) => {
     if (hit && hit.rec === rec) {           // start in-place length change
       pushHistory();
       ensureResizeMesh(rec);
-      projResize = { rec, ...resizeGrab(rec, hit.point), moved: false };
+      projResize = { rec, op: state.endOp, ...resizeGrab(rec, hit.point), moved: false };
       applyVisual();
       return;
     }
@@ -829,16 +920,24 @@ canvas.addEventListener("pointermove", (e) => {
   if (!projResize || tab === "editor") return;
   setPointerFromEvent(e);
   const grabbed = rayCoordAlongAxis(projResize);
-  let factor = (grabbed - projResize.pivot) / (projResize.origEnd - projResize.pivot);
-  factor = Math.max(0.05, Math.min(20, factor));
-  state.resizes.set(projResize.rec, { axis: projResize.axis, factor, pivot: projResize.pivot });
-  updateResizeMesh(projResize.rec);
+  const rec = projResize.rec;
+  if (projResize.op === "cut") {
+    // trim: cut plane at the grabbed coordinate, keep the pivot (far) side
+    const lo = Math.min(projResize.pivot, projResize.origEnd), hi = Math.max(projResize.pivot, projResize.origEnd);
+    const coord = Math.max(lo, Math.min(hi, grabbed));
+    state.cuts.set(rec, { axis: projResize.axis, coord, keepBelow: projResize.pivot < projResize.origEnd });
+  } else {
+    let factor = (grabbed - projResize.pivot) / (projResize.origEnd - projResize.pivot);
+    factor = Math.max(0.05, Math.min(20, factor));
+    state.resizes.set(rec, { axis: projResize.axis, factor, pivot: projResize.pivot });
+  }
+  updateResizeMesh(rec);
   projResize.moved = true;
   renderDetail();
 });
 canvas.addEventListener("pointerup", () => {
   if (projResize) {
-    if (!projResize.moved) { state.undo.pop(); if (!state.resizes.has(projResize.rec)) clearResize(projResize.rec); }
+    if (!projResize.moved) { state.undo.pop(); if (!isEdited(projResize.rec)) clearResize(projResize.rec); }
     projResize = null;
     refreshSelection({ fit: false });
   }
@@ -1211,20 +1310,39 @@ function renderDetail() {
   if (state.radius > 0) chips.push(`haare ${Math.round(state.radius * 100)} cm`);
   if (state.excluded.size) chips.push(`−${state.excluded.size} eemaldatud`);
   const resizedSel = recs.filter((r) => state.resizes.has(r));
+  const cutSel = recs.filter((r) => state.cuts.has(r));
   if (resizedSel.length === 1) chips.push(`pikkus ${Math.round(state.resizes.get(resizedSel[0]).factor * 100)}%`);
   else if (resizedSel.length > 1) chips.push(`${resizedSel.length} muudetud pikkust`);
+  if (cutSel.length) chips.push(`✂ ${cutSel.length} lõigatud`);
   $("detail-chips").innerHTML = chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("");
 
-  // single-part hint: length editing lives right here in the project view
+  // single-part hint: length/cut editing lives right here in the project view
   const single = state.selected.size === 1;
   $("resize-hint").hidden = !single;
   if (single) {
     const r = recs[0];
-    $("resize-hint").innerHTML = state.resizes.has(r)
-      ? `Pikkus muudetud → <a href="#" id="reset-resize">taasta algne</a>. Shift+lohista otsa muudab veel.`
-      : `↔ <b>Shift+lohista selle osa otsa</b>, et muuta pikkust (nt lühendada välja ulatuvat armatuuri).`;
+    const opBtns =
+      `<div class="op-row"><span class="op-lbl">Otsa lohistus:</span>` +
+      `<button class="op-btn ${state.endOp === "cut" ? "on" : ""}" data-op="cut">✂ Lõika</button>` +
+      `<button class="op-btn ${state.endOp === "resize" ? "on" : ""}" data-op="resize">↔ Venita</button></div>`;
+    let status = "";
+    if (state.cuts.has(r)) status = `Lõigatud → <a href="#" id="reset-resize">taasta algne</a>.`;
+    else if (state.resizes.has(r)) status = `Pikkus ${Math.round(state.resizes.get(r).factor * 100)}% → <a href="#" id="reset-resize">taasta algne</a>.`;
+    const concreteBtn = state.rec.pkg[r] >= 0 && !isShell(r)
+      ? `<button class="btn btn-mini" id="btn-cut-concrete">✂ Lõika betooni servani</button>` : "";
+    $("resize-hint").innerHTML =
+      opBtns +
+      `<div class="op-note">${state.endOp === "cut"
+        ? "<b>Shift+lohista otsa</b> — lõikab tüki ära (kuju ei moondu)."
+        : "<b>Shift+lohista otsa</b> — venitab/lühendab (mastaap)."}</div>` +
+      concreteBtn + (status ? `<div class="op-status">${status}</div>` : "");
+    for (const b of $("resize-hint").querySelectorAll(".op-btn")) {
+      b.addEventListener("click", () => { state.endOp = b.dataset.op; renderDetail(); });
+    }
     const reset = $("reset-resize");
     if (reset) reset.addEventListener("click", (ev) => { ev.preventDefault(); pushHistory(); clearResize(r); refreshSelection({ fit: false }); });
+    const cc = $("btn-cut-concrete");
+    if (cc) cc.addEventListener("click", () => cutAtConcrete(r));
   }
 
   const box = selectionBox();
@@ -1347,12 +1465,14 @@ async function runExtract(elements, name, opts, statusEl, button) {
 $("btn-extract").addEventListener("click", () => {
   if (!state.selected.size) return;
   const elements = [...state.selected].map((r) => state.rec.ids[r]);
-  const deforms = {};
+  const deforms = {}, cuts = {};
   for (const r of state.selected) {
-    if (state.resizes.has(r)) deforms[String(state.rec.ids[r])] = matrixRows(resizeMatrixIFC(r));
+    if (state.cuts.has(r)) cuts[String(state.rec.ids[r])] = cutPlaneWorld(state.cuts.get(r));
+    else if (state.resizes.has(r)) deforms[String(state.rec.ids[r])] = matrixRows(resizeMatrixIFC(r));
   }
   runExtract(elements, $("export-name").value.trim() || defaultExportName(),
-    { deforms: Object.keys(deforms).length ? deforms : null }, $("extract-status"), $("btn-extract"));
+    { deforms: Object.keys(deforms).length ? deforms : null, cuts: Object.keys(cuts).length ? cuts : null },
+    $("extract-status"), $("btn-extract"));
 });
 
 function matrixRows(m) {
@@ -1754,6 +1874,7 @@ function saveCurrentView() {
   doc.view = {
     base: [...state.base], excluded: [...state.excluded], hidden: [...state.hidden],
     resizes: [...state.resizes].map(([r, v]) => [r, { ...v }]),
+    cuts: [...state.cuts].map(([r, v]) => [r, { ...v }]),
     camPos: camera.position.toArray(), camTarget: controls.target.toArray(),
   };
 }
@@ -1761,7 +1882,8 @@ function restoreView(view) {
   if (!view) return;
   state.hidden = new Set(view.hidden);
   rebuildHidden();
-  state.resizes = new Map(view.resizes.map(([r, v]) => [r, { ...v }]));
+  state.resizes = new Map((view.resizes || []).map(([r, v]) => [r, { ...v }]));
+  state.cuts = new Map((view.cuts || []).map(([r, v]) => [r, { ...v }]));
   syncResizeMeshes();
   state.base = new Set(view.base);
   state.excluded = new Set(view.excluded);
@@ -1953,7 +2075,7 @@ function screenOf(rec) {
   const rect = canvas.getBoundingClientRect();
   return { x: rect.left + (c.x * 0.5 + 0.5) * rect.width, y: rect.top + (-c.y * 0.5 + 0.5) * rect.height };
 }
-window.__ime = { state, editor, isShell, recClass, recName, selectElementByRec, setBase, togglePart, toggleLayer, layerSet, hideRecs, unhideAll, editorPaste, itemMatrixIFC, editorUpdateItem, renderEditorPanel, screenOf, resizeMeshes, controls, camera, editorSelect, editorHide, editorUnhideAll, toggleMoveMode, openIfc, switchToProject, closeProject, openDocs, renderDocTabs };
+window.__ime = { state, editor, isShell, recClass, recName, recBox, selectElementByRec, setBase, togglePart, toggleLayer, layerSet, hideRecs, unhideAll, editorPaste, itemMatrixIFC, editorUpdateItem, renderEditorPanel, screenOf, resizeMeshes, controls, camera, editorSelect, editorHide, editorUnhideAll, toggleMoveMode, openIfc, switchToProject, closeProject, openDocs, renderDocTabs, cutAtConcrete, cutPlaneWorld, updateResizeMesh, ensureResizeMesh };
 
 /* ------------------------------------------------------------- startup */
 renderRecents();

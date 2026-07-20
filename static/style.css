@@ -201,6 +201,15 @@ input, select { font: inherit; }
   border-radius: 6px; padding: 6px 9px; margin-bottom: 8px; flex: 0 0 auto;
 }
 .resize-hint a { color: #a13636; }
+.op-row { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; }
+.op-lbl { color: #8a5a12; margin-right: 2px; }
+.op-btn {
+  border: 1px solid #e0cfa0; background: #fffdf7; color: #7a5410;
+  border-radius: 5px; padding: 2px 8px; font-size: 11.5px;
+}
+.op-btn.on { background: #8a5a12; border-color: #8a5a12; color: #fff; }
+.op-note { margin-bottom: 5px; }
+.op-status { margin-top: 4px; }
 .detail-members {
   overflow-y: auto; border-top: 1px solid #e4e9ee;
   padding-top: 7px; font-size: 12.5px; min-height: 40px;
