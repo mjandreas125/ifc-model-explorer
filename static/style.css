@@ -21,13 +21,28 @@ input, select { font: inherit; }
 .brand { font-size: 16px; letter-spacing: .02em; color: #33404f; }
 .brand b { color: #4a6fa5; }
 
-.tabs { display: flex; gap: 2px; background: #e8edf2; border-radius: 8px; padding: 3px; }
-.tab {
-  border: none; background: none; border-radius: 6px;
-  padding: 5px 16px; font-size: 13px; color: #5b6775;
+.doctabs {
+  display: flex; align-items: stretch; gap: 3px; flex: 1; min-width: 0;
+  overflow-x: auto; padding: 4px 2px 0;
 }
-.tab.on { background: #fff; color: #24303e; font-weight: 600; box-shadow: 0 1px 3px rgba(20,30,45,.12); }
-.tab:hover:not(.on) { color: #33404f; }
+.doctabs::-webkit-scrollbar { height: 0; }
+.doctab {
+  display: flex; align-items: center; gap: 6px; flex: 0 0 auto; max-width: 220px;
+  padding: 5px 8px 5px 11px; border: 1px solid #d7dde4; border-bottom: none;
+  border-radius: 8px 8px 0 0; background: #eef1f4; color: #5b6775;
+  font-size: 13px; cursor: pointer; user-select: none; position: relative; top: 1px;
+}
+.doctab.on { background: #fff; color: #24303e; font-weight: 600; border-color: #c6cfd9; }
+.doctab:hover:not(.on) { background: #f4f7fa; }
+.doctab__ico { flex: none; font-size: 12px; }
+.doctab__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doctab__x {
+  flex: none; width: 17px; height: 17px; line-height: 15px; text-align: center;
+  border-radius: 4px; color: #9aa4af; font-size: 15px;
+}
+.doctab__x:hover { background: #dde3ea; color: #d0454a; }
+.doctab--editor { background: #eef3f9; color: #33507a; }
+.doctab--editor.on { background: #fff; color: #24303e; }
 #editor-count { color: #4a6fa5; font-weight: 600; }
 
 .btn {
@@ -232,18 +247,21 @@ input, select { font: inherit; }
 .extract-status .path { word-break: break-all; font-size: 11.5px; margin: 4px 0; color: inherit; opacity: .85; }
 .extract-status button { margin-top: 5px; }
 
-/* editor tab */
+/* editor tab: keep the shared tools (fit/isolate/xray/move/hide) + xray slider,
+   hide project-only widgets (radius, context toggle, sidebar) */
 body[data-tab="editor"] #sidebar { display: none; }
-body[data-tab="editor"] #toolbar .tbtn:not(#btn-fit),
-body[data-tab="editor"] #toolbar .tslider,
+body[data-tab="editor"] #toolbar .tslider[title*="Haare"],
 body[data-tab="editor"] #toolbar .tcheck { display: none; }
 body[data-tab="editor"] #detail { display: none !important; }
 body[data-tab="project"] #editor-panel { display: none !important; }
+body[data-tab="project"] .editor-only { display: none !important; }
 .editor-btns { display: flex; gap: 6px; margin-top: 8px; }
 .editor-btns .btn { flex: 1; font-size: 12.5px; padding: 5px 6px; }
 .editor-row { cursor: pointer; border-radius: 5px; padding: 3px 6px !important; }
 .editor-row:hover { background: #f2f6fa; }
 .editor-row.sel { background: #e8f0fa; }
+.editor-row.hidden-row { opacity: .5; }
+.editor-row.hidden-row .t i { color: #8b96a2; }
 .editor-row .t i { color: #b07514; font-style: normal; font-size: 11px; }
 
 .ctxmenu {

@@ -28,20 +28,37 @@ DEFAULT_DIR = Path(os.environ.get("IFC_EXPLORER_START_DIR", r"D:\LiisbetSystem\f
 
 app = FastAPI(title="IFC Model Explorer")
 
-state: dict[str, Any] = {"model": None, "load_job": None, "extract_job": None}
+# Several models can be open at once (one browser tab each). Models are cheap to
+# keep in memory — they hold only the gzipped meta + a path to the on-disk mesh.
+state: dict[str, Any] = {"models": {}, "current": None, "load_job": None, "extract_job": None}
 state_lock = threading.Lock()
+
+
+def current_model() -> Optional["engine.Model"]:
+    key = state.get("current")
+    return state["models"].get(key) if key else None
 
 
 class OpenRequest(BaseModel):
     path: str
 
 
+class SwitchRequest(BaseModel):
+    key: str
+
+
+class CloseRequest(BaseModel):
+    key: str
+
+
 class ExtractRequest(BaseModel):
     elements: list[int]
     name: Optional[str] = None
     out_dir: Optional[str] = None
+    key: Optional[str] = None                          # source model (defaults to current)
     moves: Optional[dict[str, list[float]]] = None    # stepId -> [dx,dy,dz] metres
     deforms: Optional[dict[str, list[float]]] = None  # stepId -> 16 floats (row-major 4x4, IFC world m)
+    cuts: Optional[dict[str, list[float]]] = None      # stepId -> [ax, ay, az, d] world plane, keep n·x <= d
 
 
 class RevealRequest(BaseModel):
@@ -77,12 +94,27 @@ def browse(dir: str = "") -> dict[str, Any]:
     return {"dir": str(target), "parent": parent, "dirs": dirs, "files": files}
 
 
+def _tab_info(model: "engine.Model") -> dict[str, Any]:
+    f = model.meta.get("file", {})
+    return {"key": model.key, "name": f.get("name", model.path.name), "path": str(model.path),
+            "sizeMB": f.get("sizeMB"), "packages": len(model.meta.get("packages", [])), "ready": True}
+
+
+@app.get("/api/tabs")
+def tabs() -> dict[str, Any]:
+    return {"current": state.get("current"), "tabs": [_tab_info(m) for m in state["models"].values()]}
+
+
 @app.post("/api/open")
 def open_file(request: OpenRequest) -> dict[str, Any]:
     path = Path(request.path)
     if not path.is_file() or path.suffix.lower() != ".ifc":
         raise HTTPException(404, f"IFC faili ei ole: {path}")
+    key = engine.file_key(path)
     with state_lock:
+        if key in state["models"]:            # already open — just switch to it
+            state["current"] = key
+            return {"started": False, "key": key, "file": state["models"][key].meta.get("file", {})}
         job = state.get("load_job")
         if job and job.is_alive():
             raise HTTPException(409, "Laadimine juba käib")
@@ -90,14 +122,32 @@ def open_file(request: OpenRequest) -> dict[str, Any]:
         def run(status):
             model = engine.load_model(path, status)
             with state_lock:
-                state["model"] = model
-            return {"file": model.meta.get("file", {})}
+                state["models"][model.key] = model
+                state["current"] = model.key
+            return {"key": model.key, "file": model.meta.get("file", {})}
 
         job = engine.Job("load", run)
         state["load_job"] = job
-        state["model"] = None
         job.start()
-    return {"started": True}
+    return {"started": True, "key": key}
+
+
+@app.post("/api/switch")
+def switch(request: SwitchRequest) -> dict[str, Any]:
+    with state_lock:
+        if request.key not in state["models"]:
+            raise HTTPException(404, "Tab pole avatud")
+        state["current"] = request.key
+        return {"key": request.key, "file": state["models"][request.key].meta.get("file", {})}
+
+
+@app.post("/api/close")
+def close(request: CloseRequest) -> dict[str, Any]:
+    with state_lock:
+        state["models"].pop(request.key, None)
+        if state.get("current") == request.key:
+            state["current"] = next(iter(state["models"]), None)
+        return {"current": state.get("current")}
 
 
 @app.get("/api/status")
@@ -108,11 +158,16 @@ def load_status() -> dict[str, Any]:
     return job.snapshot()
 
 
-@app.get("/api/meta")
-def meta() -> Response:
-    model: Optional[engine.Model] = state.get("model")
+def _model_for(key: Optional[str]) -> "engine.Model":
+    model = state["models"].get(key) if key else current_model()
     if model is None or not model.meta_gz:
         raise HTTPException(404, "Mudel ei ole laetud")
+    return model
+
+
+@app.get("/api/meta")
+def meta(key: Optional[str] = None) -> Response:
+    model = _model_for(key)
     return Response(
         content=model.meta_gz,
         media_type="application/json",
@@ -121,16 +176,16 @@ def meta() -> Response:
 
 
 @app.get("/api/mesh.bin")
-def mesh() -> FileResponse:
-    model: Optional[engine.Model] = state.get("model")
-    if model is None or not model.mesh_path or not model.mesh_path.is_file():
+def mesh(key: Optional[str] = None) -> FileResponse:
+    model = _model_for(key)
+    if not model.mesh_path or not model.mesh_path.is_file():
         raise HTTPException(404, "Mudel ei ole laetud")
     return FileResponse(model.mesh_path, media_type="application/octet-stream")
 
 
 @app.post("/api/extract")
 def extract(request: ExtractRequest) -> dict[str, Any]:
-    model: Optional[engine.Model] = state.get("model")
+    model = state["models"].get(request.key) if request.key else current_model()
     if model is None:
         raise HTTPException(404, "Mudel ei ole laetud")
     with state_lock:
@@ -138,7 +193,9 @@ def extract(request: ExtractRequest) -> dict[str, Any]:
         if job and job.is_alive():
             raise HTTPException(409, "Eksport juba käib")
         out_dir = Path(request.out_dir) if request.out_dir else None
-        job = engine.Job("extract", lambda status: model.extract(request.elements, request.name, out_dir, status, moves=request.moves, deforms=request.deforms))
+        job = engine.Job("extract", lambda status: model.extract(
+            request.elements, request.name, out_dir, status,
+            moves=request.moves, deforms=request.deforms, cuts=request.cuts))
         state["extract_job"] = job
         job.start()
     return {"started": True}

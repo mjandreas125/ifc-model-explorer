@@ -30,7 +30,7 @@ const state = {
   undo: [],
   redo: [],
 };
-let clipboard = [];
+let clipboard = null;   // { sourceKey, sourceName, parts:[{stepId,name,mark,cls,positions:BufferGeometry}] }
 const resizeMeshes = new Map();   // rec -> THREE.Mesh (per-part overlay for resizing)
 let projResize = null;            // active in-place resize drag
 
@@ -172,7 +172,8 @@ function recName(r) { return state.names.get(state.rec.ids[r]) || recClass(r).re
 function recMark(r) { const p = state.rec.pkg[r]; return p >= 0 ? (state.packages[p]?.mark || "") : ""; }
 // "shell" = the concrete/host body (not rebar, mesh, embed, plate, member).
 // Clicking a shell grabs the whole element; clicking anything else = that one part.
-function isShell(r) { return !CAPTURE_CLASSES.has(recClass(r)); }
+function isShellCls(cls) { return !CAPTURE_CLASSES.has(cls); }
+function isShell(r) { return isShellCls(recClass(r)); }
 
 /* ------------------------------------------------------------- mesh build */
 function disposeOverlay(obj) {
@@ -195,7 +196,8 @@ function clearModel() {
   state.undo = []; state.redo = [];
   state.hoverRec = -1;
   edgeCache.clear();
-  editorClear(true);
+  // NB: the editor is an independent workspace (its own geometry snapshots) — it
+  // survives loading/switching projects and is only cleared explicitly.
   if (grid) { scene.remove(grid); grid = null; }
 }
 
@@ -762,7 +764,7 @@ function pick(e) {
   const hit = hits[0];
   if (!hit) return null;
   if (hit.object.parent === resizeGroup) {
-    return { entry: null, rec: hit.object.userData.rec, point: hit.point };
+    return { entry: null, rec: hit.object.userData.id, point: hit.point };
   }
   const entry = state.meshEntries.find((en) => en.mesh === hit.object);
   if (!entry) return null;
@@ -797,8 +799,8 @@ canvas.addEventListener("pointerdown", (e) => {
   if (e.button !== 0) return;
   let grab = false;
   if (tab === "editor") {
-    const hit = editorPick(e);
-    grab = !!(hit && editor.selected.has(hit.object.userData.rec));
+    const hit = editor.moveMode ? editorPick(e) : null;
+    grab = !!(hit && editor.selected.has(hit.object.userData.id));
   } else if (e.shiftKey && state.selected.size === 1 && !state.isolated) {
     const hit = pick(e);
     grab = !!(hit && hit.rec === [...state.selected][0]);
@@ -868,9 +870,31 @@ canvas.addEventListener("dblclick", (e) => {
 function hideCtxMenu() { $("ctxmenu").hidden = true; }
 canvas.addEventListener("contextmenu", (e) => {
   e.preventDefault();
-  if (tab === "editor") return;
-  const hit = state.isolated ? null : pick(e);
   const menu = $("ctxmenu");
+  if (tab === "editor") {
+    const hit = editorPick(e);
+    const items = [];
+    if (hit) {
+      const id = hit.object.userData.id;
+      const nm = editor.items.get(id)?.name || "osa";
+      if (!editor.selected.has(id)) items.push([`Vali "${esc(nm)}"`, () => editorSelect([id])]);
+      items.push(["Peida osa", () => editorHide([id])]);
+      items.push(["Kustuta osa", () => { editorSelect([id]); editorDelete(); }]);
+    }
+    if (editor.selected.size) {
+      items.push([`Peida valik (${editor.selected.size})`, () => editorHide([...editor.selected])]);
+      items.push([`Kustuta valik (${editor.selected.size})`, editorDelete]);
+    }
+    if (editor.hidden.size) items.push([`Näita peidetud (${editor.hidden.size})`, editorUnhideAll]);
+    if (!items.length) { hideCtxMenu(); return; }
+    menu.innerHTML = items.map(([label], i) => `<div class="ctx-item" data-i="${i}">${label}</div>`).join("");
+    [...menu.querySelectorAll(".ctx-item")].forEach((el, i) => el.addEventListener("click", () => { hideCtxMenu(); items[i][1](); }));
+    menu.style.left = Math.min(e.clientX, window.innerWidth - 240) + "px";
+    menu.style.top = Math.min(e.clientY, window.innerHeight - items.length * 34 - 12) + "px";
+    menu.hidden = false;
+    return;
+  }
+  const hit = state.isolated ? null : pick(e);
   const items = [];
   if (hit) {
     const r = hit.rec;
@@ -961,9 +985,13 @@ canvas.addEventListener("pointerleave", () => { $("tooltip").hidden = true; setH
 /* ------------------------------------------------------------- keyboard */
 function copySelection() {
   if (!state.selected.size) return;
-  clipboard = [...state.selected];
-  $("editor-count").textContent = "";
-  toast(`Kopeeritud ${clipboard.length} osa — ava Redaktor ja vajuta Ctrl+V`);
+  // snapshot geometry + labels so the editor is independent of the current project
+  const parts = [...state.selected].map((r) => ({
+    stepId: state.rec.ids[r], name: recName(r), mark: recMark(r), cls: recClass(r),
+    positions: geometryFromRecs([r], true, false).geometry,   // BufferGeometry snapshot
+  }));
+  clipboard = { sourceKey: currentProjectKey, sourceName: openDocs.get(currentProjectKey)?.name || "", parts };
+  toast(`Kopeeritud ${parts.length} osa — ava Redaktor ja vajuta Ctrl+V`);
 }
 window.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
@@ -971,7 +999,7 @@ window.addEventListener("keydown", (e) => {
   if (ctrl && e.key.toLowerCase() === "z") { e.preventDefault(); tab === "editor" ? editorUndo() : undo(); return; }
   if (ctrl && (e.key.toLowerCase() === "y" || (e.shiftKey && e.key.toLowerCase() === "z"))) { e.preventDefault(); if (tab !== "editor") redo(); return; }
   if (ctrl && e.key.toLowerCase() === "c") { if (tab !== "editor") { e.preventDefault(); copySelection(); } return; }
-  if (ctrl && e.key.toLowerCase() === "v") { if (tab === "editor") { e.preventDefault(); editorPaste(); } else if (clipboard.length) { setTab("editor"); editorPaste(); } return; }
+  if (ctrl && e.key.toLowerCase() === "v") { if (tab === "editor") { e.preventDefault(); editorPaste(); } else if (clipboard && clipboard.parts && clipboard.parts.length) { setTab("editor"); editorPaste(); } return; }
   if (e.key === "Delete" || e.key === "Backspace") {
     if (tab === "editor") editorDelete();
     else if (state.selected.size) hideRecs([...state.selected]);
@@ -979,10 +1007,14 @@ window.addEventListener("keydown", (e) => {
   }
   if (e.key === "Escape") { tab === "editor" ? editorSelect([]) : setBase([]); return; }
   if (e.key === "f" || e.key === "F") { fitAll(); return; }
-  if (tab === "editor") return;
-  if ((e.key === "i" || e.key === "I") && state.selected.size) toggleIsolate();
-  if (e.key === "x" || e.key === "X") toggleXray();
-  if ((e.key === "h" || e.key === "H") && state.selected.size) hideRecs([...state.selected]);
+  if (e.key === "x" || e.key === "X") { toggleXray(); return; }
+  if (e.key === "i" || e.key === "I") { toggleIsolate(); return; }
+  if (e.key === "h" || e.key === "H") {
+    if (tab === "editor") { if (editor.selected.size) editorHide([...editor.selected]); }
+    else if (state.selected.size) hideRecs([...state.selected]);
+    return;
+  }
+  if (e.key === "m" || e.key === "M") { if (tab === "editor") toggleMoveMode(); return; }
 });
 
 /* ------------------------------------------------------------- sidebar */
@@ -1235,13 +1267,24 @@ $("btn-remove").addEventListener("click", () => { if (state.selected.size) hideR
 
 /* ------------------------------------------------------------- toolbar */
 function toggleIsolate() {
+  if (tab === "editor") {
+    if (!editor.selected.size) return;
+    state.isolated = !state.isolated;
+    editorApplyVisual();
+    return;
+  }
   if (!state.selected.size) return;
   state.isolated = !state.isolated;
   refreshSelection({ fit: false });
 }
 function toggleXray() {
   state.xray = !state.xray;
-  applyVisual();
+  tab === "editor" ? editorApplyVisual() : applyVisual();
+}
+function toggleMoveMode() {
+  editor.moveMode = !editor.moveMode;
+  editorApplyVisual();
+  toast(editor.moveMode ? "Liigutamise režiim SEES — lohista valitud osi (Shift+otsast = pikkus)" : "Liigutamise režiim VÄLJAS — klõps valib, parem klõps peidab");
 }
 function syncRadiusLabel() {
   $("radius-value").textContent = state.radius > 0 ? `${Math.round(state.radius * 100)} cm` : "väljas";
@@ -1249,7 +1292,8 @@ function syncRadiusLabel() {
 $("btn-fit").addEventListener("click", fitAll);
 $("btn-isolate").addEventListener("click", toggleIsolate);
 $("btn-xray").addEventListener("click", toggleXray);
-$("btn-unhide").addEventListener("click", unhideAll);
+$("btn-move-mode").addEventListener("click", toggleMoveMode);
+$("btn-unhide").addEventListener("click", () => (tab === "editor" ? editorUnhideAll() : unhideAll()));
 $("xray").addEventListener("input", () => {
   matGhost.opacity = parseInt($("xray").value, 10) / 100;
 });
@@ -1273,7 +1317,7 @@ async function runExtract(elements, name, opts, statusEl, button) {
     const res = await fetch("/api/extract", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ elements, name, moves: opts.moves || null, deforms: opts.deforms || null }),
+      body: JSON.stringify({ elements, name, key: opts.key || null, moves: opts.moves || null, deforms: opts.deforms || null, cuts: opts.cuts || null }),
     });
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     while (true) {
@@ -1321,17 +1365,21 @@ function matrixRows(m) {
 /* ================================================================ EDITOR */
 let tab = "project";
 const editor = {
-  items: new Map(),   // rec -> {mesh, offset: THREE.Vector3 (IFC axes)}
+  items: new Map(),   // stepId -> {mesh, offset, resize, bbox, name, mark, cls}
+  pool: new Map(),    // stepId -> {geom, name, mark, cls, bbox} snapshot (project-independent)
   selected: new Set(),
+  hidden: new Set(),
+  sourceKey: null,    // which project the parts were copied from (for export)
+  moveMode: false,    // OFF = select/hide like the project view; ON = drag to move/resize
   undo: [],
   drag: null,
+  downPos: null,
 };
 
 function setTab(next) {
   tab = next;
   document.body.dataset.tab = tab;
-  $("tab-project").classList.toggle("on", tab === "project");
-  $("tab-editor").classList.toggle("on", tab === "editor");
+  activeView = tab === "editor" ? "editor" : currentProjectKey;
   root.visible = tab === "project";
   editorRoot.visible = tab === "editor";
   $("editor-panel").hidden = tab !== "editor";   // the whole editor panel (with the Save button)
@@ -1341,11 +1389,11 @@ function setTab(next) {
   for (const m of state.isolatedMeshes) m.mesh.visible = tab === "project" && state.isolated;
   $("tooltip").hidden = true;
   hideCtxMenu();
-  if (tab === "editor" && editor.items.size) fitAll();
-  if (tab === "project") applyVisual();
+  for (const mesh of resizeMeshes.values()) mesh.visible = tab === "project" && mesh.visible;
+  if (tab === "editor") { editorApplyVisual(); if (editor.items.size) fitAll(); }
+  else { updateUnhideButton(); applyVisual(); }
+  renderDocTabs();
 }
-$("tab-project").addEventListener("click", () => setTab("project"));
-$("tab-editor").addEventListener("click", () => setTab("editor"));
 
 // IFC-local matrix for an editor item: translate(offset) ∘ scaleAboutPivot(axis)
 function itemMatrixIFC(it) {
@@ -1365,51 +1413,66 @@ function editorUpdateItem(it) {
 }
 
 function editorSnapshot() {
-  return [...editor.items.entries()].map(([r, it]) => ({
-    r, o: [it.offset.x, it.offset.y, it.offset.z], resize: it.resize ? { ...it.resize } : null,
+  return [...editor.items.entries()].map(([id, it]) => ({
+    id, o: [it.offset.x, it.offset.y, it.offset.z], resize: it.resize ? { ...it.resize } : null,
   }));
 }
 function editorPushHistory() {
-  editor.undo.push({ items: editorSnapshot(), selected: new Set(editor.selected) });
+  editor.undo.push({ items: editorSnapshot(), selected: new Set(editor.selected), hidden: new Set(editor.hidden) });
   if (editor.undo.length > 60) editor.undo.shift();
 }
 function editorUndo() {
   const snap = editor.undo.pop();
   if (!snap) return;
-  const keep = new Set(snap.items.map((s) => s.r));
-  for (const [r, it] of [...editor.items]) {
-    if (!keep.has(r)) { editorRoot.remove(it.mesh); it.mesh.geometry.dispose(); editor.items.delete(r); }
+  const keep = new Set(snap.items.map((s) => s.id));
+  for (const [id, it] of [...editor.items]) {
+    if (!keep.has(id)) { editorRoot.remove(it.mesh); editor.items.delete(id); }
   }
   for (const s of snap.items) {
-    if (!editor.items.has(s.r)) editorAddItem(s.r);
-    const it = editor.items.get(s.r);
+    if (!editor.items.has(s.id)) editorAddItem(s.id);
+    const it = editor.items.get(s.id);
+    if (!it) continue;
     it.offset.set(s.o[0], s.o[1], s.o[2]);
     it.resize = s.resize ? { ...s.resize } : null;
     editorUpdateItem(it);
   }
-  editor.selected = new Set([...snap.selected].filter((r) => editor.items.has(r)));
+  editor.selected = new Set([...snap.selected].filter((id) => editor.items.has(id)));
+  editor.hidden = new Set([...(snap.hidden || [])].filter((id) => editor.items.has(id)));
   editorApplyVisual();
   renderEditorPanel();
 }
 
-function editorAddItem(r) {
-  const { geometry } = geometryFromRecs([r], true, false);
-  const mesh = new THREE.Mesh(geometry, matBase);
-  mesh.userData.rec = r;
+// stepId-keyed; geometry + labels come from editor.pool (snapshotted at paste time),
+// so the editor survives switching to a different project tab.
+function editorAddItem(stepId) {
+  const snap = editor.pool.get(stepId);
+  if (!snap) return;
+  const mesh = new THREE.Mesh(snap.geom, matBase);   // geometry shared from the pool
+  mesh.userData.id = stepId;
   mesh.matrixAutoUpdate = false;
   editorRoot.add(mesh);
-  const it = { mesh, offset: new THREE.Vector3(), resize: null, bbox: geometry.boundingBox.clone() };
-  editor.items.set(r, it);
+  const it = { mesh, offset: new THREE.Vector3(), resize: null, bbox: snap.bbox, name: snap.name, mark: snap.mark, cls: snap.cls };
+  editor.items.set(stepId, it);
   editorUpdateItem(it);
 }
 function editorPaste() {
-  if (!clipboard.length) { toast("Kopeeri kõigepealt valik projektist (Ctrl+C)"); return; }
+  if (!clipboard || !clipboard.parts || !clipboard.parts.length) { toast("Kopeeri kõigepealt valik projektist (Ctrl+C)"); return; }
+  if (editor.items.size && editor.sourceKey && editor.sourceKey !== clipboard.sourceKey) {
+    if (!confirm("Redaktoris on osad teisest failist. Tühjendan ja kleebin uued?")) return;
+    editorClear(true);
+  }
+  editor.sourceKey = clipboard.sourceKey;
   editorPushHistory();
   let added = 0;
-  for (const r of clipboard) {
-    if (!editor.items.has(r)) { editorAddItem(r); added++; }
+  for (const part of clipboard.parts) {
+    if (!editor.pool.has(part.stepId)) {
+      const geom = part.positions.clone();
+      geom.computeBoundingBox();
+      editor.pool.set(part.stepId, { geom, name: part.name, mark: part.mark, cls: part.cls, bbox: geom.boundingBox.clone() });
+    }
+    if (!editor.items.has(part.stepId)) { editorAddItem(part.stepId); added++; }
   }
-  editor.selected = new Set(clipboard.filter((r) => editor.items.has(r)));
+  editor.selected = new Set(clipboard.parts.map((p) => p.stepId).filter((id) => editor.items.has(id)));
   editorApplyVisual();
   renderEditorPanel();
   if (tab === "editor") fitAll();
@@ -1418,36 +1481,69 @@ function editorPaste() {
 function editorDelete() {
   if (!editor.selected.size) return;
   editorPushHistory();
-  for (const r of editor.selected) {
-    const it = editor.items.get(r);
-    if (it) { editorRoot.remove(it.mesh); it.mesh.geometry.dispose(); editor.items.delete(r); }
+  for (const id of editor.selected) {
+    const it = editor.items.get(id);
+    if (it) { editorRoot.remove(it.mesh); editor.items.delete(id); }
   }
   editor.selected.clear();
   editorApplyVisual();
   renderEditorPanel();
 }
 function editorClear(silent = false) {
-  for (const [, it] of editor.items) { editorRoot.remove(it.mesh); it.mesh.geometry.dispose(); }
+  for (const [, it] of editor.items) editorRoot.remove(it.mesh);
+  for (const snap of editor.pool.values()) snap.geom.dispose();
   editor.items.clear();
+  editor.pool.clear();
   editor.selected.clear();
+  editor.hidden.clear();
+  editor.sourceKey = null;
   editor.undo = [];
   if (!silent) { editorApplyVisual(); renderEditorPanel(); }
 }
-function editorSelect(recs) {
-  editor.selected = new Set(recs);
+function editorSelect(ids) {
+  editor.selected = new Set(ids);
   editorApplyVisual();
   renderEditorPanel();
 }
 function editorApplyVisual() {
-  for (const [r, it] of editor.items) {
-    it.mesh.material = editor.selected.has(r) ? matEditorSel : matBase;
+  for (const [id, it] of editor.items) {
+    it.mesh.visible = !editor.hidden.has(id) && (!state.isolated || editor.selected.has(id));
+    if (editor.selected.has(id)) it.mesh.material = matEditorSel;
+    else if (state.xray && isShellCls(it.cls)) it.mesh.material = matGhost;   // x-ray the concrete
+    else it.mesh.material = matBase;
+    it.mesh.renderOrder = it.mesh.material === matGhost ? 3 : 0;
   }
-  $("editor-count").textContent = editor.items.size ? `(${editor.items.size})` : "";
+  const ec = $("editor-count");
+  if (ec) ec.textContent = editor.items.size ? `(${editor.items.size})` : "";
+  const unhide = $("btn-unhide");
+  if (tab === "editor") { unhide.hidden = !editor.hidden.size; unhide.textContent = `Peidetud: ${editor.hidden.size}`; }
+  $("btn-move-mode").classList.toggle("on", editor.moveMode);
+  $("btn-xray").classList.toggle("on", state.xray);
+  $("btn-isolate").classList.toggle("on", state.isolated);
+}
+function editorHide(recs) {
+  const list = recs.filter((r) => editor.items.has(r));
+  if (!list.length) return;
+  editorPushHistory();
+  for (const r of list) { editor.hidden.add(r); editor.selected.delete(r); }
+  editorApplyVisual();
+  renderEditorPanel();
+}
+function editorUnhideAll() {
+  if (!editor.hidden.size) return;
+  editorPushHistory();
+  editor.hidden.clear();
+  editorApplyVisual();
+  renderEditorPanel();
 }
 
 function editorPick(e) {
   setPointerFromEvent(e);
-  const hits = raycaster.intersectObjects([...editor.items.values()].map((it) => it.mesh), false);
+  const targets = [];
+  for (const it of editor.items.values()) {
+    if (it.mesh.visible && it.mesh.material !== matGhost) targets.push(it.mesh); // pick through x-ray ghosts
+  }
+  const hits = raycaster.intersectObjects(targets, false);
   return hits[0] || null;
 }
 const IFC_INV = new THREE.Matrix4();  // inverse of editorRoot world matrix (world → IFC)
@@ -1459,11 +1555,12 @@ function editorRayIFC() {
 function editorPointerDown(e) {
   if (e.button !== 0) return;
   const hit = editorPick(e);
-  if (hit && editor.selected.has(hit.object.userData.rec)) {
+  const canDrag = editor.moveMode && hit && editor.selected.has(hit.object.userData.id);
+  if (canDrag) {
     editorPushHistory();
     if (e.shiftKey) {
       // RESIZE: stretch/shrink the grabbed part along its longest axis about the far end
-      const it = editor.items.get(hit.object.userData.rec);
+      const it = editor.items.get(hit.object.userData.id);
       const size = it.bbox.getSize(new THREE.Vector3());
       const axis = size.x >= size.y && size.x >= size.z ? 0 : (size.y >= size.z ? 1 : 2);
       setPointerFromEvent(e);
@@ -1528,7 +1625,8 @@ function editorPointerMove(e) {
     return;
   }
   const hit = editorPick(e);
-  canvas.style.cursor = hit ? (editor.selected.has(hit.object.userData.rec) ? "move" : "pointer") : "";
+  const onSel = hit && editor.selected.has(hit.object.userData.id);
+  canvas.style.cursor = hit ? (editor.moveMode && onSel ? "move" : "pointer") : "";
 }
 function editorPointerUp(e) {
   if (editor.drag) {
@@ -1554,7 +1652,7 @@ function editorPointerUp(e) {
   if (Math.hypot(e.clientX - x0, e.clientY - y0) > 5 || e.button !== 0) return;
   const hit = editorPick(e);
   if (!hit) { if (!ctrl) editorSelect([]); return; }
-  const r = hit.object.userData.rec;
+  const r = hit.object.userData.id;
   if (ctrl) {
     const next = new Set(editor.selected);
     next.has(r) ? next.delete(r) : next.add(r);
@@ -1570,57 +1668,137 @@ function renderEditorPanel() {
     listEl.innerHTML = `<div class="hint" style="padding:10px 2px">Redaktor on tühi.<br>1. Vali projektis element või osad<br>2. Vajuta Ctrl+C<br>3. Siin Ctrl+V — kleebi<br>4. Lohista osi, kustuta liigsed (Del)<br>5. Salvesta uus IFC</div>`;
   } else {
     const rows = [];
-    for (const [r, it] of editor.items) {
+    for (const [id, it] of editor.items) {
       let tag = "";
-      if (it.resize) tag = ` <i>· pikkus ${Math.round(it.resize.factor * 100)}%</i>`;
+      if (editor.hidden.has(id)) tag = ` <i>· peidetud</i>`;
+      else if (it.resize) tag = ` <i>· pikkus ${Math.round(it.resize.factor * 100)}%</i>`;
       else if (it.offset.lengthSq() > 1e-9) tag = ` <i>· nihutatud</i>`;
-      rows.push(`<div class="member-row editor-row ${editor.selected.has(r) ? "sel" : ""}" data-rec="${r}">` +
-        `<span class="t">${esc(recName(r))}${tag}</span><span class="n">${esc(recMark(r))}</span></div>`);
+      const cls = `member-row editor-row ${editor.selected.has(id) ? "sel" : ""} ${editor.hidden.has(id) ? "hidden-row" : ""}`;
+      rows.push(`<div class="${cls}" data-id="${id}">` +
+        `<span class="t">${esc(it.name)}${tag}</span><span class="n">${esc(it.mark)}</span></div>`);
     }
     listEl.innerHTML = rows.join("");
     for (const row of listEl.querySelectorAll(".editor-row")) {
-      const r = Number(row.dataset.rec);
+      const id = Number(row.dataset.id);
       row.addEventListener("click", (e) => {
         if (e.ctrlKey || e.metaKey) {
           const next = new Set(editor.selected);
-          next.has(r) ? next.delete(r) : next.add(r);
+          next.has(id) ? next.delete(id) : next.add(id);
           editorSelect([...next]);
-        } else editorSelect([r]);
+        } else editorSelect([id]);
       });
     }
   }
-  if (!$("editor-name").value) {
-    $("editor-name").value = clipboard.length && state.rec ? `${defaultEditorName()}` : "";
-  }
+  if (!$("editor-name").value && editor.items.size) $("editor-name").value = defaultEditorName();
   $("btn-del").disabled = !editor.selected.size;
   $("btn-editor-extract").disabled = !editor.items.size;
 }
 function defaultEditorName() {
-  const first = [...editor.items.keys()][0];
-  if (first === undefined) return "uus_projekt";
-  const mark = recMark(first);
-  return mark ? `${mark}_uus` : "uus_projekt";
+  const first = editor.items.values().next().value;
+  return first && first.mark ? `${first.mark}_uus` : "uus_projekt";
 }
 $("btn-paste").addEventListener("click", editorPaste);
 $("btn-del").addEventListener("click", editorDelete);
 $("btn-clear-editor").addEventListener("click", () => { editorPushHistory(); editorClear(); });
 $("btn-editor-extract").addEventListener("click", () => {
-  if (!editor.items.size) return;
-  const elements = [...editor.items.keys()].map((r) => state.rec.ids[r]);
+  const kept = [...editor.items.keys()].filter((id) => !editor.hidden.has(id));  // hidden = not exported
+  if (!kept.length) { toast("Redaktoris pole nähtavaid osi"); return; }
   const moves = {}, deforms = {};
-  for (const [r, it] of editor.items) {
-    const id = String(state.rec.ids[r]);
-    if (it.resize) deforms[id] = matrixRows(itemMatrixIFC(it));       // baked geometry
-    else if (it.offset.lengthSq() > 1e-9) moves[id] = [it.offset.x, it.offset.y, it.offset.z];
+  for (const stepId of kept) {
+    const it = editor.items.get(stepId);
+    if (it.resize) deforms[String(stepId)] = matrixRows(itemMatrixIFC(it));       // baked geometry
+    else if (it.offset.lengthSq() > 1e-9) moves[String(stepId)] = [it.offset.x, it.offset.y, it.offset.z];
   }
-  runExtract(elements, $("editor-name").value.trim() || defaultEditorName(),
-    { moves: Object.keys(moves).length ? moves : null, deforms: Object.keys(deforms).length ? deforms : null },
+  runExtract(kept, $("editor-name").value.trim() || defaultEditorName(),
+    { moves: Object.keys(moves).length ? moves : null, deforms: Object.keys(deforms).length ? deforms : null, key: editor.sourceKey },
     $("editor-extract-status"), $("btn-editor-extract"));
 });
+
+/* ============================================================ documents */
+const openDocs = new Map();     // key -> {key, name, path, sizeMB, packages, view}
+let currentProjectKey = null;   // the loaded project (server "current")
+let activeView = null;          // a project key, or "editor"
+
+function shortName(name) {
+  const base = String(name).replace(/\.ifc$/i, "");
+  return base.length > 22 ? base.slice(0, 20) + "…" : base;
+}
+function ensureDoc(key, file, path) {
+  if (!openDocs.has(key)) {
+    openDocs.set(key, { key, name: file?.name || "IFC", path: path || file?.path || "", sizeMB: file?.sizeMB, packages: file?.packages, view: null });
+  }
+}
+function renderDocTabs() {
+  const el = $("doctabs");
+  el.innerHTML = "";
+  for (const [key, doc] of openDocs) {
+    const t = document.createElement("div");
+    t.className = "doctab" + (activeView === key && tab === "project" ? " on" : "");
+    t.innerHTML = `<span class="doctab__ico">📄</span><span class="doctab__name" title="${esc(doc.name)}">${esc(shortName(doc.name))}</span><span class="doctab__x" title="Sulge vahekaart">×</span>`;
+    t.querySelector(".doctab__name").addEventListener("click", () => activateProject(key));
+    t.querySelector(".doctab__ico").addEventListener("click", () => activateProject(key));
+    t.querySelector(".doctab__x").addEventListener("click", (e) => { e.stopPropagation(); closeProject(key); });
+    el.appendChild(t);
+  }
+  const ed = document.createElement("div");
+  ed.className = "doctab doctab--editor" + (tab === "editor" ? " on" : "");
+  ed.innerHTML = `<span class="doctab__ico">✂️</span><span class="doctab__name">Redaktor</span><span id="editor-count">${editor.items.size ? "(" + editor.items.size + ")" : ""}</span>`;
+  ed.addEventListener("click", () => setTab("editor"));
+  el.appendChild(ed);
+}
+
+function saveCurrentView() {
+  if (!currentProjectKey || !state.rec) return;
+  const doc = openDocs.get(currentProjectKey);
+  if (!doc) return;
+  doc.view = {
+    base: [...state.base], excluded: [...state.excluded], hidden: [...state.hidden],
+    resizes: [...state.resizes].map(([r, v]) => [r, { ...v }]),
+    camPos: camera.position.toArray(), camTarget: controls.target.toArray(),
+  };
+}
+function restoreView(view) {
+  if (!view) return;
+  state.hidden = new Set(view.hidden);
+  rebuildHidden();
+  state.resizes = new Map(view.resizes.map(([r, v]) => [r, { ...v }]));
+  syncResizeMeshes();
+  state.base = new Set(view.base);
+  state.excluded = new Set(view.excluded);
+  refreshSelection({ fit: false });
+  if (view.camPos) { fly = null; camera.position.fromArray(view.camPos); controls.target.fromArray(view.camTarget); }
+}
+
+function activateProject(key) {
+  if (key === currentProjectKey && tab === "project") return;
+  if (key === currentProjectKey) { setTab("project"); return; }  // same model, was in editor
+  switchToProject(key);
+}
+async function switchToProject(key) {
+  saveCurrentView();
+  const res = await fetch("/api/switch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key }) });
+  if (!res.ok) { toast("Ei saa vahekaarti vahetada"); return; }
+  currentProjectKey = key;
+  await loadModelData(key);
+  restoreView(openDocs.get(key)?.view);
+  renderDocTabs();
+}
+async function closeProject(key) {
+  await fetch("/api/close", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key }) }).catch(() => {});
+  openDocs.delete(key);
+  if (currentProjectKey === key) {
+    currentProjectKey = null;
+    const next = [...openDocs.keys()][0];
+    if (next) { await switchToProject(next); }
+    else { clearModel(); state.rec = null; $("welcome").hidden = false; $("toolbar").hidden = true; $("file-chip").hidden = true; setTab("project"); }
+  }
+  renderDocTabs();
+}
 
 /* --------------------------------------------------------- file loading */
 async function openIfc(path) {
   closeModal();
+  saveCurrentView();
   $("welcome").hidden = true;
   const res = await fetch("/api/open", {
     method: "POST",
@@ -1628,14 +1806,21 @@ async function openIfc(path) {
     body: JSON.stringify({ path }),
   });
   if (!res.ok) { toast((await res.json()).detail || "Viga faili avamisel"); return; }
+  const data = await res.json();
   rememberRecent(path);
+  if (data.started === false && data.key) {   // already open → just switch
+    ensureDoc(data.key, data.file, path);
+    currentProjectKey = data.key;
+    await loadModelData(data.key);
+    restoreView(openDocs.get(data.key)?.view);
+    renderDocTabs();
+    return;
+  }
   $("load-progress").hidden = false;
-  $("file-chip").hidden = false;
-  $("file-chip").textContent = path.split("\\").pop();
-  pollLoad();
+  pollLoad(data.key, path);
 }
 
-async function pollLoad() {
+async function pollLoad(key, path) {
   clearTimeout(state.polling);
   const snap = await (await fetch("/api/status")).json();
   $("load-progress-fill").style.width = (snap.pct || 0) + "%";
@@ -1647,17 +1832,26 @@ async function pollLoad() {
   }
   if (snap.done) {
     $("load-progress-text").textContent = "Laen 3D andmeid brauserisse …";
-    await loadModelData();
+    const resultKey = (snap.result && snap.result.key) || key;
+    currentProjectKey = resultKey;
+    ensureDoc(resultKey, snap.result && snap.result.file, path);
+    await loadModelData(resultKey);
+    renderDocTabs();
     $("load-progress").hidden = true;
     return;
   }
-  state.polling = setTimeout(pollLoad, 700);
+  state.polling = setTimeout(() => pollLoad(key, path), 700);
 }
 
-async function loadModelData() {
+async function loadModelData(key) {
+  // Always fetch a specific model by key so state.rec and currentProjectKey can
+  // never desync (which would tag copied parts with the wrong source file).
+  if (!key) key = (await (await fetch("/api/tabs")).json()).current;
+  currentProjectKey = key;
+  const q = key ? "?key=" + encodeURIComponent(key) : "";
   const [meta, buffer] = await Promise.all([
-    (await fetch("/api/meta")).json(),
-    (await fetch("/api/mesh.bin")).arrayBuffer(),
+    (await fetch("/api/meta" + q)).json(),
+    (await fetch("/api/mesh.bin" + q)).arrayBuffer(),
   ]);
   state.meta = meta;
   state.packages = meta.packages;
@@ -1666,14 +1860,16 @@ async function loadModelData() {
   $("file-chip").hidden = false;
   $("file-chip").textContent =
     `${meta.file.name} — ${meta.file.sizeMB} MB · ${meta.file.schema} · ${meta.packages.length} elementi`;
+  if (currentProjectKey) ensureDoc(currentProjectKey, meta.file);
   const cats = [...new Set(meta.packages.map((p) => p.category))].sort();
   $("category-filter").innerHTML =
     `<option value="">Kõik kategooriad</option>` +
     cats.map((c) => `<option value="${esc(c)}">${esc(categoryLabel(c))}</option>`).join("");
-  buildScene(buffer);
+  setTab("project");        // switch to project BEFORE building — else fitAll frames the empty editor
+  buildScene(buffer);       // builds root meshes and fits the camera on them
   renderList();
   renderEditorPanel();
-  setTab("project");
+  fitAll();                 // frame the new model even if a file was already open
 }
 
 function toast(message, ms = 4000) {
@@ -1757,7 +1953,7 @@ function screenOf(rec) {
   const rect = canvas.getBoundingClientRect();
   return { x: rect.left + (c.x * 0.5 + 0.5) * rect.width, y: rect.top + (-c.y * 0.5 + 0.5) * rect.height };
 }
-window.__ime = { state, editor, isShell, recClass, recName, selectElementByRec, setBase, togglePart, toggleLayer, layerSet, hideRecs, unhideAll, editorPaste, itemMatrixIFC, editorUpdateItem, renderEditorPanel, screenOf, resizeMeshes, controls, camera };
+window.__ime = { state, editor, isShell, recClass, recName, selectElementByRec, setBase, togglePart, toggleLayer, layerSet, hideRecs, unhideAll, editorPaste, itemMatrixIFC, editorUpdateItem, renderEditorPanel, screenOf, resizeMeshes, controls, camera, editorSelect, editorHide, editorUnhideAll, toggleMoveMode, openIfc, switchToProject, closeProject, openDocs, renderDocTabs };
 
 /* ------------------------------------------------------------- startup */
 renderRecents();
@@ -1766,19 +1962,24 @@ renderEditorPanel();
 document.body.dataset.tab = "project";
 (async () => {
   try {
+    const tabsData = await (await fetch("/api/tabs")).json();
+    for (const t of tabsData.tabs || []) ensureDoc(t.key, t, t.path);
+    currentProjectKey = tabsData.current || null;
+    renderDocTabs();
     const snap = await (await fetch("/api/status")).json();
-    if (snap.done && !snap.error) {
+    if (currentProjectKey || (snap.done && !snap.error)) {
       const probe = await fetch("/api/meta");
       if (probe.ok) {
         $("welcome").hidden = true;
         await loadModelData();
+        renderDocTabs();
         return;
       }
     }
     if (snap.stage && snap.stage !== "idle" && !snap.done) {
       $("welcome").hidden = true;
       $("load-progress").hidden = false;
-      pollLoad();
+      pollLoad(null, null);
     }
   } catch { /* server idle */ }
 })();

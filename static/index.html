@@ -13,16 +13,13 @@
 <body>
 <header id="topbar">
   <div class="brand">IFC <b>Model Explorer</b></div>
-  <nav class="tabs">
-    <button id="tab-project" class="tab on">Projekt</button>
-    <button id="tab-editor" class="tab">Redaktor <span id="editor-count"></span></button>
-  </nav>
-  <button id="btn-open" class="btn btn-primary">Ava IFC…</button>
-  <div id="file-chip" class="file-chip" hidden></div>
+  <nav id="doctabs" class="doctabs"></nav>
+  <button id="btn-open" class="btn btn-primary" title="Ava IFC fail uude vahekaardile">＋ Ava IFC…</button>
   <div id="load-progress" class="load-progress" hidden>
     <div class="load-progress__bar"><div id="load-progress-fill"></div></div>
     <span id="load-progress-text"></span>
   </div>
+  <div id="file-chip" class="file-chip" hidden></div>
 </header>
 
 <div id="layout">
@@ -49,6 +46,7 @@
 
     <div id="toolbar" class="toolbar" hidden>
       <button class="tbtn" id="btn-fit" title="Mahuta kõik (F)">⤢ Kõik</button>
+      <button class="tbtn editor-only" id="btn-move-mode" title="Liigutamise režiim (M) — lohista valitud osi">✥ Liiguta</button>
       <button class="tbtn" id="btn-isolate" title="Isoleeri valik (I)">◧ Isoleeri</button>
       <button class="tbtn" id="btn-xray" title="Röntgen — betoon läbipaistvaks, armatuur nähtavale (X)">◍ Röntgen</button>
       <label class="tslider" title="Röntgeni läbipaistvus">
@@ -94,7 +92,7 @@
         </div>
       </div>
       <div id="editor-list" class="detail-members"></div>
-      <div class="hint">Ctrl+V — kleebi · lohista — liiguta · Alt+lohista — üles/alla · <b>Shift+lohista otsast — muuda pikkust</b> · Del — kustuta · Ctrl+Z — tagasi</div>
+      <div class="hint">Klõps valib · parem klõps — peida/kustuta · H peida · Del kustuta · <b>✥ Liiguta</b> (M) sisse → lohista osi, Alt+lohista üles/alla, Shift+lohista otsast muudab pikkust · Ctrl+Z tagasi</div>
       <div class="editor-btns">
         <button id="btn-paste" class="btn">📋 Kleebi</button>
         <button id="btn-del" class="btn">🗑 Kustuta</button>

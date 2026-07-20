@@ -38,12 +38,16 @@ for _p in (str(REPO_ROOT), str(TOOL_ROOT)):  # prefer the bundled copy
 import extract_ifc_element_library as lib  # noqa: E402  (proven exact-subset exporter)
 
 CACHE_DIR = TOOL_ROOT / "cache"
+CACHE_VERSION = 3   # bump to invalidate on-disk caches when grouping/mesh format changes
 CPU = max(1, os.cpu_count() or 1)
 
 CONCRETE_CLASSES = {
     "IfcSlab", "IfcWall", "IfcWallStandardCase", "IfcBeam", "IfcColumn",
-    "IfcFooting", "IfcPile", "IfcStair", "IfcStairFlight",
+    "IfcFooting", "IfcPile", "IfcStair", "IfcStairFlight", "IfcRamp", "IfcRampFlight",
 }
+STAIR_CLASSES = {"IfcStair", "IfcStairFlight", "IfcRamp", "IfcRampFlight"}
+# Broadened primary set: lib's structural classes + stair/ramp bodies.
+PRIMARY_CLASSES = set(lib.PRIMARY_CLASSES) | STAIR_CLASSES
 EMBED_CLASSES = {"IfcDiscreteAccessory", "IfcMechanicalFastener", "IfcFastener", "IfcPlate", "IfcMember"}
 NON_PRECAST_KEYWORDS = ("GROUT", "MORTAR", "VUUGIBETOON", "AVA MOODUSTAJA", "AVAMOODUSTAJA", "OPENING FORMER")
 
@@ -136,11 +140,13 @@ def bulk_flat_psets(model: Any, progress=None) -> dict[int, dict[str, str]]:
 def is_primary(entity: Any, flat: dict[str, str]) -> bool:
     """Generic precast-root test (broadened from lib.is_p2_primary)."""
     cls = entity.is_a()
-    if cls not in lib.PRIMARY_CLASSES:
+    if cls not in PRIMARY_CLASSES:
         return False
     text = lib.entity_text(entity, flat)
     if any(k in f" {text} " for k in NON_PRECAST_KEYWORDS):
         return False
+    if cls in STAIR_CLASSES:   # a stair/ramp body is always a precast root (e.g. TE-0201 IfcStairFlight)
+        return True
     mark = lib.explicit_mark(flat)
     if mark and cls in CONCRETE_CLASSES:
         return True
@@ -148,7 +154,7 @@ def is_primary(entity: Any, flat: dict[str, str]) -> bool:
         return True
     if lib.concrete_reference_mark(flat):
         return True
-    if any(k in text for k in ["RB TREPP", "KEERDTREPP", "VUNDAMENT", "PLAATVUNDAMENT", "BETOONPADI"]):
+    if any(k in text for k in ["RB TREPP", "KEERDTREPP", "TREPIMAR", "TREPP", "VUNDAMENT", "PLAATVUNDAMENT", "BETOONPADI"]):
         return True
     return False
 
@@ -287,13 +293,15 @@ class Model:
             for entity in products:
                 assigned.add(entity.id())
             flat = flats.get(main.id(), {})
+            tag = lib.plain(getattr(main, "Tag", ""))
+            # Tekla cast marks live in Tag for assemblies and (often) stairs; prefer a
+            # meaningful Tag over a generic ObjectType like "Betoon / бетон".
+            prefer_tag = tag if (main.is_a("IfcElementAssembly") or main.is_a() in STAIR_CLASSES) and tag and not lib.norm(tag).startswith("ID") else ""
             mark = (
-                lib.plain(getattr(main, "Tag", ""))
-                if main.is_a("IfcElementAssembly")
-                else ""
-            ) or lib.explicit_mark(flat) or lib.concrete_reference_mark(flat) or lib.plain(
-                getattr(main, "ObjectType", "")
-            ) or lib.plain(getattr(main, "Name", "")) or f"IFC-{main.id()}"
+                prefer_tag or lib.explicit_mark(flat) or lib.concrete_reference_mark(flat)
+                or lib.plain(getattr(main, "ObjectType", "")) or lib.plain(getattr(main, "Name", ""))
+                or f"IFC-{main.id()}"
+            )
             package = {
                 "main": main,
                 "members": products,
@@ -373,6 +381,20 @@ class Model:
                     members.update(e for e in linked if e.is_a("IfcProduct"))
                     relations.update(linked_relations)
                 add_package(cluster[0], members, relations)
+
+        # 2b) fallback: if nothing was recognised as a concrete root, promote every
+        # concrete/structural body to its own package so the model is never "all context"
+        # and the sidebar always has something to click.
+        if not packages:
+            for entity in model.by_type("IfcElement"):
+                if entity.id() in assigned:
+                    continue
+                if entity.is_a() not in CONCRETE_CLASSES:
+                    continue
+                if any(k in lib.entity_text(entity, flats.get(entity.id(), {})) for k in NON_PRECAST_KEYWORDS):
+                    continue
+                add_package(entity, {entity}, {"varugrupp: betoontoode"})
+            status("group", 82, f"Varugrupeerimine: {len(packages)} betoontoodet")
 
         # 3) geometric attachment: unmarked accessories >=50 % inside one package envelope
         package_boxes = []
@@ -563,62 +585,125 @@ class Model:
         patched.write(str(out_path))
 
     @staticmethod
-    def _apply_deforms(source: Any, patched: Any, deforms: dict[str, list[float]]) -> None:
-        """Re-bake elements as transformed surface models (editor resize).
-
-        Recompute each element's world mesh, apply the world-space affine, convert
-        back to the element's local coordinates and replace its Body representation
-        with an IfcFaceBasedSurfaceModel (valid in IFC2X3 and IFC4).
-        """
+    def _write_surface_body(patched: Any, element: Any, world_m: "np.ndarray", faces: "np.ndarray", unit_scale: float) -> None:
+        """Replace an element's Body with an IfcFaceBasedSurfaceModel built from world
+        vertices (metres) + triangle indices, mapped into the element's local coords."""
         import ifcopenshell.util.placement as placement_util
-        import ifcopenshell.util.unit as unit_util
+        if not len(world_m) or not len(faces):
+            return
+        world_file = world_m / unit_scale
+        placement = placement_util.get_local_placement(element.ObjectPlacement)
+        inv = np.linalg.inv(placement)
+        local = world_file @ inv[:3, :3].T + inv[:3, 3]
+        points = [patched.create_entity("IfcCartesianPoint", (float(x), float(y), float(z))) for x, y, z in local]
+        ifc_faces = []
+        for a, b, c in faces:
+            loop = patched.create_entity("IfcPolyLoop", (points[a], points[b], points[c]))
+            bound = patched.create_entity("IfcFaceOuterBound", loop, True)
+            ifc_faces.append(patched.create_entity("IfcFace", (bound,)))
+        face_set = patched.create_entity("IfcConnectedFaceSet", ifc_faces)
+        surface_model = patched.create_entity("IfcFaceBasedSurfaceModel", (face_set,))
+        definition = element.Representation
+        reps = list(definition.Representations)
+        body = next((r for r in reps if getattr(r, "RepresentationIdentifier", "") == "Body"), reps[0] if reps else None)
+        context = body.ContextOfItems if body else patched.by_type("IfcGeometricRepresentationContext")[0]
+        new_body = patched.create_entity("IfcShapeRepresentation", context, "Body", "SurfaceModel", (surface_model,))
+        definition.Representations = tuple(
+            r for r in reps if getattr(r, "RepresentationIdentifier", "") != "Body") + (new_body,)
 
+    @staticmethod
+    def _element_world_mesh(source: Any, patched: Any, step_id: str):
+        """(element_in_patched, world_verts_m, faces) for a source step id, or None."""
         settings = ifcopenshell.geom.settings()
         settings.set("use-world-coords", True)
-        unit_scale = unit_util.calculate_unit_scale(patched)  # metres per file unit
+        try:
+            src_entity = source.by_id(int(step_id))
+            element = patched.by_guid(lib.plain(getattr(src_entity, "GlobalId", "")))
+        except Exception:
+            return None
+        if not getattr(element, "Representation", None):
+            return None
+        try:
+            shape = ifcopenshell.geom.create_shape(settings, src_entity)
+        except Exception:
+            return None
+        verts = np.asarray(shape.geometry.verts, dtype=np.float64).reshape(-1, 3)
+        faces = np.asarray(shape.geometry.faces, dtype=np.int64).reshape(-1, 3)
+        if not len(verts) or not len(faces):
+            return None
+        return element, verts, faces
 
+    @classmethod
+    def _apply_deforms(cls, source: Any, patched: Any, deforms: dict[str, list[float]]) -> None:
+        """Re-bake elements as transformed surface models (editor/project resize)."""
+        import ifcopenshell.util.unit as unit_util
+        unit_scale = unit_util.calculate_unit_scale(patched)
         for step_id, flat in deforms.items():
-            try:
-                src_entity = source.by_id(int(step_id))
-                guid = lib.plain(getattr(src_entity, "GlobalId", ""))
-                element = patched.by_guid(guid)
-            except Exception:
+            got = cls._element_world_mesh(source, patched, step_id)
+            if not got:
                 continue
-            if not getattr(element, "Representation", None):
-                continue
-            try:
-                shape = ifcopenshell.geom.create_shape(settings, src_entity)
-            except Exception:
-                continue
-            verts = np.asarray(shape.geometry.verts, dtype=np.float64).reshape(-1, 3)  # world metres
-            faces = np.asarray(shape.geometry.faces, dtype=np.int64).reshape(-1, 3)
-            if not len(verts) or not len(faces):
-                continue
-            affine = np.asarray(flat, dtype=np.float64).reshape(4, 4)  # row-major, IFC world m
-            world_new = verts @ affine[:3, :3].T + affine[:3, 3]       # (N,3) metres
-            world_file = world_new / unit_scale                         # to file units (e.g. mm)
-            placement = placement_util.get_local_placement(element.ObjectPlacement)  # file units
-            inv = np.linalg.inv(placement)
-            local = world_file @ inv[:3, :3].T + inv[:3, 3]             # element-local file units
+            element, verts, faces = got
+            affine = np.asarray(flat, dtype=np.float64).reshape(4, 4)  # row-major IFC world m
+            world_new = verts @ affine[:3, :3].T + affine[:3, 3]
+            cls._write_surface_body(patched, element, world_new, faces, unit_scale)
 
-            points = [patched.create_entity("IfcCartesianPoint", (float(x), float(y), float(z)))
-                      for x, y, z in local]
-            ifc_faces = []
-            for a, b, c in faces:
-                loop = patched.create_entity("IfcPolyLoop", (points[a], points[b], points[c]))
-                bound = patched.create_entity("IfcFaceOuterBound", loop, True)
-                ifc_faces.append(patched.create_entity("IfcFace", (bound,)))
-            face_set = patched.create_entity("IfcConnectedFaceSet", ifc_faces)
-            surface_model = patched.create_entity("IfcFaceBasedSurfaceModel", (face_set,))
+    @classmethod
+    def _apply_cuts(cls, source: Any, patched: Any, cuts: dict[str, list[float]]) -> None:
+        """Trim elements by a world plane — keep the n·x <= d side (e.g. cut protruding
+        rebar flush with the concrete). Straddling triangles are clipped exactly."""
+        import ifcopenshell.util.unit as unit_util
+        unit_scale = unit_util.calculate_unit_scale(patched)
+        for step_id, plane in cuts.items():
+            got = cls._element_world_mesh(source, patched, step_id)
+            if not got:
+                continue
+            element, verts, faces = got
+            n = np.asarray(plane[:3], dtype=np.float64)
+            nlen = np.linalg.norm(n)
+            if nlen < 1e-9:
+                continue
+            n = n / nlen
+            d = float(plane[3]) / nlen
+            sd = verts @ n - d               # signed distance per vertex; keep <= 0
+            out_v: list[tuple] = []
+            out_f: list[tuple] = []
+            index: dict[tuple, int] = {}
 
-            definition = element.Representation
-            reps = list(definition.Representations)
-            body = next((r for r in reps if getattr(r, "RepresentationIdentifier", "") == "Body"), reps[0] if reps else None)
-            context = body.ContextOfItems if body else patched.by_type("IfcGeometricRepresentationContext")[0]
-            new_body = patched.create_entity(
-                "IfcShapeRepresentation", context, "Body", "SurfaceModel", (surface_model,))
-            definition.Representations = tuple(
-                r for r in reps if getattr(r, "RepresentationIdentifier", "") != "Body") + (new_body,)
+            def vid(p) -> int:
+                key = (round(p[0], 6), round(p[1], 6), round(p[2], 6))
+                i = index.get(key)
+                if i is None:
+                    i = len(out_v); index[key] = i; out_v.append((p[0], p[1], p[2]))
+                return i
+
+            for tri in faces:
+                pts = verts[tri]
+                s = sd[tri]
+                keep = [pts[i] for i in range(3) if s[i] <= 1e-9]
+                if len(keep) == 3:
+                    poly = [pts[0], pts[1], pts[2]]
+                elif len(keep) == 0:
+                    continue
+                else:
+                    # Sutherland-Hodgman clip of the triangle against half-space s<=0
+                    poly = []
+                    for i in range(3):
+                        a, b = pts[i], pts[(i + 1) % 3]
+                        sa, sb = s[i], s[(i + 1) % 3]
+                        if sa <= 1e-9:
+                            poly.append(a)
+                        if (sa < 0) != (sb < 0) and abs(sa - sb) > 1e-12:
+                            t = sa / (sa - sb)
+                            poly.append(a + t * (b - a))
+                    if len(poly) < 3:
+                        continue
+                ids = [vid(p) for p in poly]
+                for k in range(1, len(ids) - 1):        # fan triangulation
+                    out_f.append((ids[0], ids[k], ids[k + 1]))
+            if not out_f:
+                continue
+            cls._write_surface_body(patched, element, np.asarray(out_v, dtype=np.float64),
+                                    np.asarray(out_f, dtype=np.int64), unit_scale)
 
     def ensure_ifc(self, status=None) -> Any:
         with self.lock:
@@ -630,13 +715,13 @@ class Model:
 
     def extract(self, element_ids: list[int], name: Optional[str], out_dir: Optional[Path], status,
                 moves: Optional[dict[str, list[float]]] = None,
-                deforms: Optional[dict[str, list[float]]] = None) -> dict[str, Any]:
+                deforms: Optional[dict[str, list[float]]] = None,
+                cuts: Optional[dict[str, list[float]]] = None) -> dict[str, Any]:
         """Export an arbitrary set of source elements (by STEP id) as one exact IFC subset.
 
-        moves: optional {stepId: [dx, dy, dz]} world offsets in METRES (editor) — applied
-        to each element's ObjectPlacement in the exported file.
-        deforms: optional {stepId: 16 floats} row-major 4x4 affine in IFC world coords (metres)
-        — the element's geometry is recomputed, transformed and re-baked (editor resize).
+        moves: {stepId: [dx,dy,dz]} world offsets in METRES — applied to ObjectPlacement.
+        deforms: {stepId: 16 floats} row-major 4x4 IFC-world affine — geometry re-baked (resize).
+        cuts: {stepId: [ax,ay,az,d]} world plane — geometry trimmed to the n·x <= d side.
         """
         if not element_ids:
             raise ValueError("empty selection")
@@ -665,12 +750,15 @@ class Model:
         patched = lib.export_package(model, package, out_path)
 
         if deforms:
-            status("deform", 62, f"Muudan {len(deforms)} osa geomeetriat …")
+            status("deform", 60, f"Muudan {len(deforms)} osa geomeetriat …")
             self._apply_deforms(model, patched, deforms)
+        if cuts:
+            status("cut", 66, f"Lõikan {len(cuts)} osa …")
+            self._apply_cuts(model, patched, cuts)
         if moves:
             status("moves", 70, f"Rakendan {len(moves)} osa nihked …")
             self._apply_moves(model, patched, moves, out_path)
-        elif deforms:
+        elif deforms or cuts:
             patched.write(str(out_path))
 
         status("validate", 85, "Kontrollin tulemust …")
